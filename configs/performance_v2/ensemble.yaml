@@ -1,0 +1,4 @@
+data: {targets: [CD68], submit_targets: [CD68]}
+ensemble: {method: uniform, weights: [], validation_only: true, optimizer: coordinate, optimizer_failure_policy: uniform, cross_validate_weights: true, allow_range_wise: false, weight_source: best_jpg, allow_unsafe_model_soup_lineage: false, allow_unsafe_model_soup_validation: false}
+validation: {primary_domain: jpg, domains: [float, uint8, jpg], group_by_roi: true, bootstrap_by_roi: true, bootstrap_samples: 1000}
+inference: {use_ema: false, weight_source: best_jpg, tta: d4}

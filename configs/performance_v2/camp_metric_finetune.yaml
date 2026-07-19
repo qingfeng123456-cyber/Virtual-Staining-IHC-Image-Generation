@@ -1,0 +1,10 @@
+data: {targets: [CD68], submit_targets: [CD68]}
+model: {name: camp_vs_v2}
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.01
+  phase_a: {mse: 0.35, charbonnier: 0.15, ssim: 0.35, ms_ssim: 0.05, pyramid: 0.07, gradient: 0.02, statistics: 0.01}
+  phase_b: {mse: 0.35, charbonnier: 0.15, ssim: 0.35, ms_ssim: 0.05, pyramid: 0.07, gradient: 0.02, statistics: 0.01}
+train: {stage: metric_finetune, epochs: 20, lr: 0.00001, stage_lr_scale: 0.05, batch_size: 1, gradient_accumulation: 8}
+validation: {primary_domain: jpg, domains: [float, uint8, jpg], group_by_roi: true, bootstrap_by_roi: true, bootstrap_samples: 1000}
+

@@ -1,0 +1,5 @@
+suite: performance_v2_p1
+order: [hierarchical_prototypes, intensity_calibrator, restormer_lite, activity_sampler, grouped_cv, famo, dapi_mae, learned_ensemble]
+one_change_per_run: true
+default_enabled: false
+

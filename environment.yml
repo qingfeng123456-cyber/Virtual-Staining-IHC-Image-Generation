@@ -1,0 +1,7 @@
+name: MEDICAL
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+

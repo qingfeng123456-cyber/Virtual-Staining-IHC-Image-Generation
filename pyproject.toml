@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aic-virtual-staining"
+version = "0.1.0"
+description = "Deterministic DAPI-to-mIHC virtual staining competition pipeline"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "Pillow>=10,<13",
+  "opencv-python-headless>=4.9,<5",
+  "scikit-image>=0.23,<0.27",
+  "scikit-learn>=1.4,<2",
+  "scipy>=1.13,<1.18",
+  "PyYAML>=6,<7",
+  "tqdm>=4.66,<5",
+  "matplotlib>=3.8,<4",
+  "tensorboard>=2.16,<3",
+  "psutil>=5.9,<8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
+
+[project.scripts]
+virtual-staining = "virtual_staining.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

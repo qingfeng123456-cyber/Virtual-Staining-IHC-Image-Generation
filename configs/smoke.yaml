@@ -1,0 +1,42 @@
+data:
+  targets: [CD68]
+  submit_targets: [CD68]
+  max_train_samples: 16
+  max_val_samples: 8
+  smoke_count: 8
+  pin_memory: false
+model:
+  name: residual_unet
+  base_channels: 8
+  encoder_depths: [1, 1, 1, 1]
+  use_sobel_input: false
+  use_prototypes: false
+  deep_supervision: false
+loss:
+  charbonnier: 0.65
+  ssim: 0.35
+  ms_ssim: 0.0
+  gradient: 0.0
+  frequency: 0.0
+  correlation: 0.0
+  prototype_activation: 0.0
+  prototype_diversity: 0.0
+train:
+  device: cpu
+  hardware_profile: smoke
+  epochs: 2
+  batch_size: 2
+  gradient_accumulation: 1
+  lr: 0.001
+  warmup_epochs: 0
+  amp: false
+  early_stopping_patience: 5
+  save_top_k: 1
+inference:
+  device: cpu
+  batch_size: 2
+  tta: none
+submission:
+  official: false
+  allow_smoke_manifest: true
+

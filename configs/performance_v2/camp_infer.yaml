@@ -1,0 +1,5 @@
+data: {targets: [CD68], submit_targets: [CD68]}
+model: {name: camp_vs_v2}
+validation: {primary_domain: jpg, domains: [float, uint8, jpg]}
+inference: {device: auto, batch_size: 1, use_ema: false, weight_source: best_jpg, tta: d4, context: true, jpeg_quality: 100, jpeg_subsampling: 0, jpeg_optimize: false}
+

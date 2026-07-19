@@ -1,0 +1,16 @@
+data:
+  targets: [HLA-DR, CD45RO, Vimentin, CD68]
+  submit_targets: [CD68]
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_task_adapters: true
+  use_prototypes: true
+train:
+  epochs: 200
+  batch_size: 2
+  gradient_accumulation: 4
+  ema: true
+inference:
+  tta: d4
+

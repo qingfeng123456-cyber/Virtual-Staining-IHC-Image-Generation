@@ -1,0 +1,5 @@
+data: {targets: [CD68], submit_targets: [CD68]}
+model: {name: camp_vs_v2}
+train: {stage: target_finetune, epochs: 80, lr: 0.00005, freeze_encoder_epochs: 5, stage_lr_scale: 0.25, batch_size: 1, gradient_accumulation: 8}
+validation: {primary_domain: jpg, domains: [float, uint8, jpg], group_by_roi: true, bootstrap_by_roi: true, bootstrap_samples: 1000}
+

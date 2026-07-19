@@ -1,0 +1,16 @@
+model:
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+audit:
+  roi_leakage_verifiable: false
+  official_test_status: missing
+  require_verified_grid: true
+  allow_numeric_stem_inference: false
+  allow_edge_graph_inference: false
+train:
+  resolved_hardware_profile: gpu_8gb
+  evaluate_weight_sources: [raw, ema]

@@ -1,0 +1,185 @@
+project:
+  name: aic_virtual_staining
+  output_root: outputs
+  artifact_root: artifacts
+  seed: 2026
+
+data:
+  root: AUTO
+  organ: auto
+  train_split: train
+  val_split: val
+  test_split: test
+  targets: [HLA-DR, CD45RO, Vimentin, CD68]
+  submit_targets: [CD68]
+  group_key: roi_id
+  val_ratio: 0.2
+  surrogate_group_size: 32
+  smoke_count: 8
+  image_size: 256
+  input_mode: auto
+  target_modes: auto
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+  max_train_samples: null
+  max_val_samples: null
+  grouped_inner_folds:
+    enabled: false
+    fold_count: 5
+    seed: 2026
+    require_official_train: true
+    coordinate_source: filename
+    output_csv: artifacts/performance_v2/inner_fold_assignments.csv
+  activity_sampler:
+    enabled: false
+    activity_key: target_activity
+    num_bins: 4
+    seed: 2026
+    num_samples: null
+
+model:
+  name: multi_marker_restorer
+  base_channels: 48
+  encoder_depths: [2, 2, 4, 6]
+  decoder_depths: [2, 2, 2]
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  shared_prototypes: 8
+  task_prototypes: 8
+  prototype_temperature: 0.1
+  deep_supervision: true
+  output_activation: sigmoid
+  context:
+    enabled: false
+    grid_size: 3
+    missing_policy: center
+    include_center: true
+    cache_size: 0
+    token_dim: 128
+    encoder_width: 24
+    context_dropout: 0.1
+    fusion_scales: [4, 8, 16]
+    bottleneck_cross_attention: false
+    residual_init: 0.0
+    stop_gradient: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    tile_chunk_size: 9
+
+loss:
+  mse: 0.0
+  charbonnier: 0.40
+  ssim: 0.35
+  ms_ssim: 0.10
+  gradient: 0.10
+  frequency: 0.05
+  structure_weight_alpha: 1.0
+  correlation: 0.02
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+  deep_supervision_weights: [1.0, 0.5, 0.25]
+  pyramid: 0.0
+  statistics: 0.0
+  schedule: constant
+  phase_a_ratio: 0.7
+
+train:
+  device: auto
+  hardware_profile: auto
+  epochs: 200
+  batch_size: auto
+  gradient_accumulation: auto
+  optimizer: adamw
+  lr: 0.0002
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  scheduler: cosine
+  amp: true
+  amp_dtype: auto
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.999
+  early_stopping_patience: 30
+  save_top_k: 3
+  resume: null
+  deterministic: true
+  max_oom_retries: 3
+  prototype_monitor:
+    enabled: false
+    dead_threshold: 0.0001
+    attention_visuals_enabled: false
+    attention_visual_count: 4
+    attention_visual_seed: 2026
+    attention_visual_size: 256
+
+validation:
+  primary_metric: ssim
+  primary_domain: float
+  psnr_norm_min: 15.0
+  psnr_norm_max: 40.0
+  save_visuals: true
+  worst_k: 32
+  group_by_roi: true
+  bootstrap_by_roi: false
+  bootstrap_samples: 1000
+  save_predictions: false
+  domains: [float]
+
+inference:
+  device: auto
+  batch_size: auto
+  use_ema: true
+  tta: d4
+  ensemble_checkpoints: []
+  jpeg_quality: 100
+  jpeg_subsampling: 0
+  jpeg_optimize: false
+  context: false
+  weight_source: auto
+
+multitask:
+  optimizer: equal
+  gradient_cosine_enabled: false
+  log_gradient_cosine_every: 500
+
+pretrain:
+  enabled: false
+  mask_ratio: 0.5
+  block_size: 16
+  epochs: 50
+  lr: 0.0002
+  context_encoder: false
+  neighbor_consistency: false
+  neighbor_consistency_weight: 0.0
+
+ensemble:
+  method: uniform
+  weights: []
+  validation_only: true
+  optimizer: coordinate
+  optimizer_failure_policy: uniform
+  cross_validate_weights: true
+  allow_range_wise: false
+  weight_source: best_jpg
+  allow_unsafe_model_soup_lineage: false
+  allow_unsafe_model_soup_validation: false
+
+budget:
+  active: full
+  smoke: {epochs: 2, max_train_samples: 64, max_val_samples: 32}
+  screen: {epochs: 20, folds: [0], seeds: [2026]}
+  confirm: {epochs: 80, folds: [0, 1], seeds: [2026]}
+  full: {epochs: 120, folds: [], seeds: [2026]}
+
+submission:
+  root_name: results
+  split_name: test
+  fake_suffix: _fake
+  extension: .jpg
+  create_zip: true
+  official: true
+  allow_smoke_manifest: false

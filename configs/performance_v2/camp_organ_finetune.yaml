@@ -1,0 +1,5 @@
+data: {targets: [CD68], submit_targets: [CD68]}
+model: {name: camp_vs_v2, conditioning: {marker_embedding: true, organ_embedding: true, film: true, zero_init: true, embedding_dim: 128}, adapters: {marker: true, organ: true, mixture_of_experts: false, reduction: 4}}
+train: {stage: organ_finetune, epochs: 60, lr: 0.00002, stage_lr_scale: 0.1, batch_size: 1, gradient_accumulation: 8}
+validation: {primary_domain: jpg, domains: [float, uint8, jpg], group_by_roi: true, bootstrap_by_roi: true, bootstrap_samples: 1000}
+

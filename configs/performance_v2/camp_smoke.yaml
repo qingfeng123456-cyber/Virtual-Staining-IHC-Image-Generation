@@ -1,0 +1,72 @@
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+data:
+  targets: [CD68]
+  submit_targets: [CD68]
+  max_train_samples: 32
+  max_val_samples: 16
+  num_workers: 0
+  pin_memory: false
+model:
+  name: camp_vs_v2
+  use_sobel_input: false
+  local_encoder:
+    type: naf
+    widths: [8, 16, 32, 64]
+    depths: [1, 1, 1, 1]
+    drop_path: 0.0
+  context:
+    enabled: false
+    grid_size: 3
+    missing_policy: center
+    include_center: true
+    token_dim: 32
+    encoder_width: 8
+    context_dropout: 0.0
+    fusion_scales: [4, 8, 16]
+    bottleneck_cross_attention: false
+    residual_init: 0.0
+    stop_gradient: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    tile_chunk_size: 9
+  global_mixer: {enabled: true, type: restormer_lite, blocks_1_8: 1, blocks_1_16: 1, heads: [2, 4], expansion: 2.0}
+  conditioning: {marker_embedding: true, organ_embedding: false, film: true, zero_init: true, embedding_dim: 32}
+  adapters: {marker: true, organ: false, mixture_of_experts: false, reduction: 4}
+  prototypes: {enabled: false, scales: [8, 16], shared_count: 4, marker_count: 4, organ_count: 0, dim: 32, temperature: 0.1, residual_init: 0.0, reset_dead: false, dead_threshold: 0.0001}
+  output: {base_detail: true, max_detail_amplitude: 1.0, deep_supervision: true, deep_supervision_scales: [1, 2, 4, 8]}
+  intensity_calibrator: {enabled: true, max_gain_delta: 0.15, max_bias: 0.15}
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.7
+  phase_a: {mse: 0.1, charbonnier: 0.35, ssim: 0.45, ms_ssim: 0.0, pyramid: 0.1, gradient: 0.0, statistics: 0.0}
+  phase_b: {mse: 0.35, charbonnier: 0.15, ssim: 0.4, ms_ssim: 0.0, pyramid: 0.1, gradient: 0.0, statistics: 0.0}
+train:
+  device: cpu
+  epochs: 2
+  batch_size: 2
+  gradient_accumulation: 1
+  warmup_epochs: 0
+  amp: false
+  ema: true
+  early_stopping_patience: 5
+  save_top_k: 1
+validation:
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  bootstrap_by_roi: false
+  save_predictions: true
+inference:
+  device: cpu
+  batch_size: 2
+  tta: none
+  context: false
+submission:
+  official: false
+  allow_smoke_manifest: true
+budget:
+  active: smoke
+

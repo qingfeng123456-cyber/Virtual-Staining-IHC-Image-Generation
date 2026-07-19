@@ -1,0 +1,13 @@
+suite: performance_v2_p0_strict
+target: CD68
+order: [A0, A1, A2, A3, A4, A5, A6, A7, A8]
+stages:
+  A0: {config: configs/performance_v2/p0_a0_baseline.yaml, description: legacy main model raw/no-TTA reproduction}
+  A1: {parent: A0, config: configs/performance_v2/camp_a1_loss.yaml, changes: [two_phase_mse_ssim]}
+  A2: {parent: A1, config: configs/performance_v2/p0_a2_base_detail.yaml, changes: [laplacian_pyramid, base_detail]}
+  A3: {parent: A2, config: configs/performance_v2/p0_a3_context.yaml, changes: [context_encoder, zero_init_film], requires_verified_grid: true}
+  A4: {parent: A3, config: configs/performance_v2/p0_a4_cross_attention.yaml, changes: [context_cross_attention], requires_verified_grid: true}
+  A5: {parent: A4, config: configs/performance_v2/camp_target_finetune.yaml, changes: [target_finetune]}
+  A6: {parent: A5, config: configs/performance_v2/camp_organ_finetune.yaml, changes: [organ_adapter]}
+  A7: {parent: A6, config: configs/performance_v2/camp_infer.yaml, changes: [d4_tta]}
+  A8: {parent: A7, config: configs/performance_v2/ensemble.yaml, changes: [checkpoint_average, prediction_ensemble]}

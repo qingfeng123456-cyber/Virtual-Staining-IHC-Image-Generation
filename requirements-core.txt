@@ -1,0 +1,12 @@
+numpy>=1.26,<3
+pandas>=2.2,<3
+Pillow>=10,<13
+opencv-python-headless>=4.9,<5
+scikit-image>=0.23,<0.27
+scikit-learn>=1.4,<2
+scipy>=1.13,<1.18
+PyYAML>=6,<7
+tqdm>=4.66,<5
+matplotlib>=3.8,<4
+tensorboard>=2.16,<3
+psutil>=5.9,<8

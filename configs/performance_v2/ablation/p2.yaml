@@ -1,0 +1,5 @@
+suite: performance_v2_p2
+order: [shift_tolerant, mambair_v2_lite, mixture_of_experts, range_wise_ensemble, neighbor_consistency, context_5x5]
+one_change_per_run: true
+default_enabled: false
+requires_p0_p1_complete: true

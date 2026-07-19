@@ -1,0 +1,14 @@
+data:
+  targets: [CD68]
+  submit_targets: [CD68]
+train:
+  device: auto
+inference:
+  device: auto
+  batch_size: auto
+  use_ema: true
+  tta: d4
+submission:
+  official: true
+  allow_smoke_manifest: false
+

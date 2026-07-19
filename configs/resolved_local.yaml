@@ -1,0 +1,6 @@
+# This file is rewritten by `audit-data` for the dataset on the current machine.
+# Keep the repository copy neutral so a removed sample dataset cannot shadow a
+# newly supplied official dataset.
+data:
+  root: AUTO
+  num_workers: 0

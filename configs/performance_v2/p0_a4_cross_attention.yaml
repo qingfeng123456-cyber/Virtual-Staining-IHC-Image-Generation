@@ -1,0 +1,37 @@
+project: {output_root: outputs/performance_v2, artifact_root: artifacts/performance_v2}
+data: {targets: [CD68], submit_targets: [CD68]}
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: true
+  max_detail_amplitude: 1.0
+  context:
+    enabled: true
+    grid_size: 3
+    missing_policy: center
+    include_center: true
+    cache_size: 64
+    token_dim: 128
+    encoder_width: 24
+    encoder_depth: 2
+    context_dropout: 0.10
+    fusion_scales: [4, 8]
+    bottleneck_cross_attention: true
+    residual_init: 0.0
+    stop_gradient: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.7
+  phase_a: {mse: 0.10, charbonnier: 0.30, ssim: 0.35, ms_ssim: 0.10, pyramid: 0.10, gradient: 0.05, statistics: 0.0}
+  phase_b: {mse: 0.35, charbonnier: 0.10, ssim: 0.35, ms_ssim: 0.05, pyramid: 0.10, gradient: 0.05, statistics: 0.0}
+train: {epochs: 120, batch_size: 1, gradient_accumulation: 8, ema: true}
+validation: {primary_domain: jpg, domains: [float, uint8, jpg], group_by_roi: true, bootstrap_by_roi: true, bootstrap_samples: 1000, save_predictions: true}
+inference: {use_ema: false, tta: none, context: true}
+budget: {active: full}
