@@ -1,6 +1,14 @@
-# This file is rewritten by `audit-data` for the dataset on the current machine.
-# Keep the repository copy neutral so a removed sample dataset cannot shadow a
-# newly supplied official dataset.
 data:
-  root: AUTO
+  root: dataset/official
+  input_channels: 1
+  target_channels:
+    HLA-DR: 1
+    CD45RO: 1
+    Vimentin: 1
+    CD68: 1
   num_workers: 0
+augmentation:
+  max_translation: 0
+audit:
+  roi_leakage_verifiable: true
+  official_test_status: available

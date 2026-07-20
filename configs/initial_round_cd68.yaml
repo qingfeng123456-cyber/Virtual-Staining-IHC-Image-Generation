@@ -1,0 +1,75 @@
+# Conservative initial-round configuration for the official ROI dataset.
+# Change both data.targets and data.submit_targets if the required marker changes.
+project:
+  output_root: outputs/initial_round
+  artifact_root: artifacts
+  seed: 2026
+
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: false
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 0
+
+loss:
+  schedule: constant
+  mse: 0.0
+  charbonnier: 0.40
+  ssim: 0.35
+  ms_ssim: 0.10
+  gradient: 0.10
+  frequency: 0.05
+  correlation: 0.02
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+
+train:
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw, ema]
+  save_top_k: 1
+
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+
+pretrain:
+  enabled: false
+
+multitask:
+  optimizer: equal
+  gradient_cosine_enabled: false
+
+submission:
+  official: true
+  allow_smoke_manifest: false

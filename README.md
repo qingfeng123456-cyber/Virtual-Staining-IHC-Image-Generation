@@ -2,15 +2,45 @@
 
 这是一个完整、可复现的 PyTorch 虚拟染色工程。模型读取 DAPI 图像 patch，生成与输入同尺寸、同位置的 HLA-DR、CD45RO、Vimentin 或 CD68 图像。
 
-当前仓库已经清理为“代码交付状态”：
+当前仓库已经接入初赛官方数据：
 
-- 不包含开发阶段的样例数据；
-- 不包含 smoke、消融实验、失败实验或样例训练产生的 checkpoint；
-- 不包含预测图、TensorBoard 日志、审计图片、ZIP 和提交结果；
-- dataset/、outputs/ 和 artifacts/ 会在放入真实数据或运行程序后重新产生内容；
-- 真实数据、训练权重和生成结果默认被 .gitignore 排除。
+- 数据位于 dataset/official/，约 188 MiB；
+- train 有 DAPI 和四个目标 marker，test 只有 DAPI；
+- 开发阶段的样例数据、样例权重、失败实验权重和旧预测已经删除；
+- artifacts/ 中保留的是当前初赛数据的 manifest、审计和小型验收报告；
+- 真实训练产生的 outputs/、checkpoint 和提交结果默认被 .gitignore 排除。
 
-你不需要修改 Python 源码才能换数据。把官方数据放进 dataset/official/，完成审计后运行训练命令即可。
+你不需要修改 Python 源码。初赛使用 configs/initial_round_cd68.yaml，完整命令见第 9、10 和 16 节。
+
+## 当前初赛数据审计结论
+
+2026-07-19 已对 dataset/official/ 实际运行发现、manifest、全量图像审计、ROI 审计、CUDA smoke、official-test 推理和 ZIP 校验。
+
+| 项目 | 实测结果 |
+|---|---:|
+| train DAPI | 6,296 |
+| train 每个目标 | 6,296 |
+| official test DAPI | 1,346 |
+| train ROI | ROI000～ROI024，共 25 个 |
+| test ROI | ROI025～ROI029，共 5 个 |
+| 本地 train split | 5,004 张，20 个 ROI |
+| 本地 val split | 1,292 张，5 个 ROI |
+| train/val ROI 重叠 | 0 |
+| train/val 相邻 patch 跨界 | 0 |
+| 坐标解析 | 6,296 / 6,296 |
+| 损坏、缺失、配对失败 | 0 |
+| official-test 提交校验 | 1,346 / 1,346，valid=true |
+
+所有图像都是 256×256 RGB JPEG，但三个 RGB 通道逐像素相同，因此模型逻辑输入和输出使用 1 通道，提交时仍按原始 RGB JPEG 规格保存。四个目标抽样对齐诊断的中位 dx/dy 都是 0，不启用平移补偿。
+
+### “验证分数”和“测试分数”不是一回事
+
+- 本地可以计算的是 val_manifest.csv 上的 SSIM、PSNR 和 JPG round-trip 指标，因为这些图像有 CD68 标签；
+- official test 只有 DAPI，没有目标标签，所以本地无法计算 test SSIM/PSNR；
+- test 命令负责生成 1,346 张预测图和提交 ZIP；
+- 真正的初赛 test 分数只能把 ZIP 上传赛事评测系统后获得。
+
+项目不会用 test 伪造标签，也不会拿 val 冒充 official test。
 
 ---
 
@@ -112,7 +142,7 @@ results/test/<TARGET>/<stem>_fake.jpg + ZIP
 | tests/ | 单元测试与工程链路测试 |
 | scripts/ | 环境安装和验收脚本 |
 | docs/ | 模型、实验、提交和 V2 技术文档 |
-| dataset/ | 放赛事真实数据；当前为空 |
+| dataset/ | 赛事真实数据；当前初赛包位于 dataset/official/，约 188 MiB |
 | artifacts/ | 运行后生成 manifest、数据审计和指标 |
 | outputs/ | 运行后生成 checkpoint、日志和预测 |
 | results/ | 正式提交结果 |
@@ -157,13 +187,13 @@ results/test/<TARGET>/<stem>_fake.jpg + ZIP
 - context 只能读取 DAPI，不能读取相邻标签；
 - 只有真实 ROI 网格、无邻域泄漏且 JPG 指标稳定提高后，相关模块才允许进入最终配置。
 
-第一次用真实数据不要打开全部 V2 开关。推荐先使用：
+第一次用初赛数据不要打开全部 V2 开关。正式初赛先使用：
 
 ~~~text
-configs/performance_v2/retained_unpromoted.yaml
+configs/initial_round_cd68.yaml
 ~~~
 
-它保留三域验证和严格数据规则，但关闭尚未通过真实 ROI 消融的上下文、base/detail、预训练和高级集成。
+它以保守的 MultiMarkerRestorer base32 为主线，保留三域验证和严格数据规则，且将 save_top_k 固定为 1；尚未完成真实 ROI 性能消融的 context、base/detail、预训练和高级集成保持关闭。
 
 ### 3.4 损失与训练
 
@@ -189,7 +219,7 @@ configs/performance_v2/retained_unpromoted.yaml
 - 可选 D4 测试时增强；
 - 支持结构兼容的 checkpoint 平均；
 - learned ensemble 和 model soup 只能使用 validation/OOF；
-- official test 为空时正式预测会失败；
+- 当前 official test 已识别 1,346 张；若以后更换数据包后 test 缺失或 manifest 为空，正式预测会明确失败；
 - 文件命名为 <stem>_fake.jpg；
 - ZIP 第一层必须是 results/；
 - validator 检查数量、命名、重复、缺失、尺寸、mode、解码和 ZIP 成员。
@@ -312,37 +342,45 @@ conda run -n MEDICAL python -m virtual_staining.cli env
 项目根目录/dataset/official/
 ~~~
 
-推荐结构：
+当前初赛数据的真实结构：
 
 ~~~text
 dataset/
 └─ official/
    ├─ train/
-   │  ├─ colon/
-   │  │  ├─ DAPI/
-   │  │  ├─ HLA-DR/
-   │  │  ├─ CD45RO/
-   │  │  ├─ Vimentin/
-   │  │  └─ CD68/
-   │  ├─ liver/    （同样五个 marker）
-   │  └─ stomach/  （同样五个 marker）
-   ├─ val/
-   │  ├─ colon/    （同样五个 marker）
-   │  ├─ liver/
-   │  └─ stomach/
+   │  ├─ DAPI/       6,296 张
+   │  ├─ HLA-DR/     6,296 张
+   │  ├─ CD45RO/     6,296 张
+   │  ├─ Vimentin/   6,296 张
+   │  └─ CD68/       6,296 张
    └─ test/
-      ├─ colon/DAPI/
-      ├─ liver/DAPI/
-      └─ stomach/DAPI/
+      └─ DAPI/       1,346 张
 ~~~
 
-### train/val 规则
+这份数据没有单独的 val 文件夹。程序会用 seed 2026 按完整 ROI 从 25 个 train ROI 中固定切出 5 个作为本地验证集：
+
+~~~text
+本地 train ROI:
+ROI000, ROI001, ROI002, ROI003, ROI007, ROI008, ROI009, ROI010,
+ROI012, ROI013, ROI014, ROI015, ROI016, ROI017, ROI018, ROI019,
+ROI020, ROI021, ROI022, ROI024
+
+本地 val ROI:
+ROI004, ROI005, ROI006, ROI011, ROI023
+
+official test ROI:
+ROI025, ROI026, ROI027, ROI028, ROI029
+~~~
+
+同一个 ROI 绝不会被拆到 train 和 val 两边，相邻 patch 也不会跨 split。
+
+### train 规则
 
 - 同一个 patch 的 DAPI 和四个目标必须同名；
 - 当前 manifest 构建器要求 DAPI、HLA-DR、CD45RO、Vimentin、CD68 配对齐全；
 - 图像尺寸一致；
 - 保留官方原始 JPEG，不要提前重编码；
-- 有官方 train/val 时不要重新混合。
+- 不要手工移动 ROI 来改变当前固定划分。
 
 ### test 规则
 
@@ -351,7 +389,7 @@ dataset/
 - 保持官方文件名；
 - test 不参与统计、预训练、模型选择或调参。
 
-推荐官方文件名形式：
+当前官方文件名形式：
 
 ~~~text
 ROI000_00_00.jpg
@@ -359,9 +397,9 @@ ROI000_00_01.jpg
 ROI000_01_00.jpg
 ~~~
 
-这能解析出 ROI、row、col，用于可靠邻域和 ROI 分组验证。纯数字文件名不能作为权威坐标。
+文件名能可靠解析 ROI、row、col。实测 row 向下、col 向右，水平邻接 5,591 对、垂直邻接 5,561 对，方向和边界连续性均通过。网格允许存在组织外形造成的空洞，缺失坐标会用 context mask 表示，不会读取不存在的图片。
 
-代码也支持 organ/split/marker、split/marker 和 organ/marker，但新手建议使用上面的 split/organ/marker。
+当前目录没有 organ 层，manifest 会如实记为 unknown；这不影响单阶段训练和提交。代码仍支持后续阶段可能出现的 split/organ/marker 布局。
 
 ---
 
@@ -412,7 +450,7 @@ conda run -n MEDICAL python -m virtual_staining.cli discover-data --data-root AU
 ### 9.2 构建 manifest
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO
+conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/initial_round_cd68.yaml --data-root AUTO
 ~~~
 
 检查：
@@ -427,7 +465,7 @@ conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config conf
 
 ~~~powershell
 conda run -n MEDICAL python -m virtual_staining.cli audit-data --data-root dataset/official
-conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --output-dir artifacts/performance_v2
+conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/initial_round_cd68.yaml --data-root AUTO --manifest artifacts/manifests/train_manifest.csv artifacts/manifests/val_manifest.csv --output-dir artifacts/performance_v2
 ~~~
 
 至少确认图像可解码、尺寸/通道正确、配对完整、train/val 无泄漏、ROI 坐标解析正确。如果要启用 context，方向、边界连续性和 context gate 必须通过。
@@ -435,15 +473,19 @@ conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config conf
 ### 9.4 一轮 sanity train
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli train --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --target CD68 --run-id cd68_sanity --max-epochs 1 --set train.save_top_k=1
+conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --run-id cd68_sanity --max-epochs 1 --set data.max_train_samples=16 --set data.max_val_samples=8 --set model.base_channels=8 --set train.gradient_accumulation=1 --set validation.bootstrap_samples=100 --set validation.save_visuals=false
 ~~~
 
-它只验证真实 Dataset、forward/backward、CUDA/AMP、checkpoint 和 validation。它不是正式训练结果。成功后可删除 outputs/performance_v2/cd68_sanity/。
+它只验证真实 Dataset、forward/backward、CUDA/AMP、checkpoint 和 validation。它不是正式训练结果。成功后可删除 outputs/initial_round/cd68_sanity/。
+
+上述真实数据 smoke 已实际通过。临时模型只训练了 16 张、验证了 8 张，因此它的 JPG SSIM 0.44854 / PSNR 10.0494 只能证明评分链路正常，不能当作正式初赛成绩。
+
+小型验收摘要保存在 artifacts/initial_round_smoke_report.json；大体积临时权重、预测和 ZIP 在验证后删除。
 
 ### 9.5 正式单目标训练
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli train --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --target CD68 --run-id cd68_official_seed2026 --set train.save_top_k=1
+conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --run-id cd68_initial_full_seed2026
 ~~~
 
 保守配置默认：
@@ -461,7 +503,7 @@ conda run -n MEDICAL python -m virtual_staining.cli train --config configs/perfo
 ### 9.6 断点续训
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli resume --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --checkpoint outputs/performance_v2/cd68_official_seed2026/checkpoints/last.ckpt
+conda run -n MEDICAL python -m virtual_staining.cli resume --config configs/initial_round_cd68.yaml --data-root AUTO --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/last.ckpt
 ~~~
 
 恢复会检查目标、ImageSpec 和 manifest hash，并恢复 optimizer、scheduler、scaler、EMA、epoch 和随机状态。
@@ -469,29 +511,31 @@ conda run -n MEDICAL python -m virtual_staining.cli resume --config configs/perf
 ### 9.7 验证
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli validate --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --target CD68 --checkpoint outputs/performance_v2/cd68_official_seed2026/checkpoints/best_ssim.ckpt
+conda run -n MEDICAL python -m virtual_staining.cli validate --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt
 ~~~
 
-优先看真实 ROI 分组的 JPG round-trip SSIM/PSNR，同时检查 float、uint8、raw 和 EMA，不能只选择最好看的单一数值。
+这条命令会在完整 1,292 张本地 val 上计算分数。优先看输出中的 primary_domain=jpg、domains.jpg.macro.mean_ssim 和 mean_psnr，同时检查 float、uint8、raw 和 EMA。指标 JSON 和逐图 CSV 会写入对应 run 的 validation 目录。
+
+这里得到的是本地验证分数。official test 没有 CD68 标签，所以无法在本机运行同样的 SSIM/PSNR 计算。
 
 ---
 
 ## 10. 推理和竞赛提交
 
-只有 official test 放入 dataset/official/test/ 后才运行。
+当前 official test 已放入 dataset/official/test/DAPI/，共有 1,346 张。
 
 ### 10.1 推理
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli predict --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --checkpoint outputs/performance_v2/cd68_official_seed2026/checkpoints/best_ssim.ckpt --manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir outputs/performance_v2/cd68_official_seed2026/predictions
+conda run -n MEDICAL python -m virtual_staining.cli predict --config configs/initial_round_cd68.yaml --data-root AUTO --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt --manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir outputs/initial_round/cd68_initial_full_seed2026/predictions
 ~~~
 
-test manifest 为空时失败是正确行为，不要用 validation 替代。
+当前 test manifest 已确认有 1,346 行。命令成功后应报告 count=1346。它生成预测但不计算分数，因为 test 没有标签。
 
 ### 10.2 生成结果和 ZIP
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli make-submission --config configs/performance_v2/retained_unpromoted.yaml --pred-dir outputs/performance_v2/cd68_official_seed2026/predictions --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir submission_ready
+conda run -n MEDICAL python -m virtual_staining.cli make-submission --config configs/initial_round_cd68.yaml --pred-dir outputs/initial_round/cd68_initial_full_seed2026/predictions --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir submission_ready
 ~~~
 
 预期：
@@ -508,7 +552,7 @@ submission_ready/
 conda run -n MEDICAL python -m virtual_staining.cli validate-submission --submission-dir submission_ready/results --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --zip-path submission_ready/submission_CD68.zip --artifact-dir submission_ready/validation
 ~~~
 
-只有 validator 成功才上传 ZIP。不要手工再压缩一次，否则容易多一层目录。
+只有 validator 成功才上传 ZIP。不要手工再压缩一次，否则容易多一层目录。上传赛事平台后显示的分数才是 official test 分数。
 
 ---
 
@@ -550,7 +594,7 @@ V2 是研究框架，不是把所有开关一次打开。
 
 正确顺序：
 
-1. retained_unpromoted.yaml 建立真实 ROI/JPG 基线；
+1. 用 initial_round_cd68.yaml 建立真实 ROI/JPG 基线；
 2. 固定 split、seed、预算和验证协议；
 3. 每次只加入一个模块；
 4. 至少两个 fold 或 seed 趋势一致；
@@ -666,13 +710,13 @@ conda run -n MEDICAL python -m virtual_staining.cli --help
 $env:AIC_DATA_ROOT = (Resolve-Path .\dataset\official).Path
 
 conda run -n MEDICAL python -m virtual_staining.cli discover-data --data-root AUTO
-conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO
+conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/initial_round_cd68.yaml --data-root AUTO
 conda run -n MEDICAL python -m virtual_staining.cli audit-data --data-root dataset/official
-conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --output-dir artifacts/performance_v2
-conda run -n MEDICAL python -m virtual_staining.cli train --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --target CD68 --run-id cd68_official_seed2026 --set train.save_top_k=1
-conda run -n MEDICAL python -m virtual_staining.cli validate --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --target CD68 --checkpoint outputs/performance_v2/cd68_official_seed2026/checkpoints/best_ssim.ckpt
-conda run -n MEDICAL python -m virtual_staining.cli predict --config configs/performance_v2/retained_unpromoted.yaml --data-root AUTO --target CD68 --checkpoint outputs/performance_v2/cd68_official_seed2026/checkpoints/best_ssim.ckpt --manifest artifacts/manifests/test_manifest.csv --output-dir outputs/performance_v2/cd68_official_seed2026/predictions
-conda run -n MEDICAL python -m virtual_staining.cli make-submission --config configs/performance_v2/retained_unpromoted.yaml --pred-dir outputs/performance_v2/cd68_official_seed2026/predictions --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir submission_ready
+conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/initial_round_cd68.yaml --data-root AUTO --manifest artifacts/manifests/train_manifest.csv artifacts/manifests/val_manifest.csv --output-dir artifacts/performance_v2
+conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --run-id cd68_initial_full_seed2026
+conda run -n MEDICAL python -m virtual_staining.cli validate --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt
+conda run -n MEDICAL python -m virtual_staining.cli predict --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt --manifest artifacts/manifests/test_manifest.csv --output-dir outputs/initial_round/cd68_initial_full_seed2026/predictions
+conda run -n MEDICAL python -m virtual_staining.cli make-submission --config configs/initial_round_cd68.yaml --pred-dir outputs/initial_round/cd68_initial_full_seed2026/predictions --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir submission_ready
 conda run -n MEDICAL python -m virtual_staining.cli validate-submission --submission-dir submission_ready/results --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --zip-path submission_ready/submission_CD68.zip --artifact-dir submission_ready/validation
 ~~~
 

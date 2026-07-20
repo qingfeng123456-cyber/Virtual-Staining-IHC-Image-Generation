@@ -20,6 +20,24 @@ def test_config_precedence_and_hash(tmp_path: Path) -> None:
     assert output.is_file()
 
 
+def test_initial_round_config_is_roi_jpg_safe_and_space_bounded() -> None:
+    config = load_config(
+        Path("configs/initial_round_cd68.yaml"), include_resolved=False
+    )
+
+    assert config["project"]["output_root"] == "outputs/initial_round"
+    assert config["data"]["root"] == "AUTO"
+    assert config["data"]["targets"] == ["CD68"]
+    assert config["data"]["submit_targets"] == ["CD68"]
+    assert config["model"]["context"]["enabled"] is False
+    assert config["validation"]["primary_domain"] == "jpg"
+    assert config["validation"]["domains"] == ["float", "uint8", "jpg"]
+    assert config["validation"]["group_by_roi"] is True
+    assert config["validation"]["bootstrap_by_roi"] is True
+    assert config["train"]["save_top_k"] == 1
+    assert config["validation"]["save_predictions"] is False
+
+
 def test_config_rejects_unknown_cli_override() -> None:
     with pytest.raises(ConfigError, match="Unknown key"):
         load_config(

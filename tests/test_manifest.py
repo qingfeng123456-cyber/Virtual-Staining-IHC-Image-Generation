@@ -131,3 +131,48 @@ def test_preserves_official_train_val_and_test_is_input_only(tmp_path: Path) -> 
     assert test_rows[0]["dapi_path"].endswith("ROI003_00_00.png")
     assert not test_rows[0]["cd68_path"]
     assert result.official_test_missing is False
+
+
+def test_split_marker_layout_builds_roi_grouped_validation_and_official_test(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "official"
+    for roi_index in range(5):
+        stem = f"ROI{roi_index:03d}_00_00"
+        for marker_index, marker in enumerate(MARKERS):
+            path = root / "train" / marker / f"{stem}.jpg"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(
+                np.full(
+                    (8, 8, 3),
+                    10 + roi_index * len(MARKERS) + marker_index,
+                    np.uint8,
+                ),
+                mode="RGB",
+            ).save(path)
+    test_path = root / "test" / "DAPI" / "ROI005_00_00.jpg"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.full((8, 8, 3), 20, np.uint8), mode="RGB").save(test_path)
+
+    result = build_manifests(
+        root,
+        workspace=tmp_path,
+        output_dir="manifests",
+        val_fraction=0.2,
+        seed=2026,
+    )
+
+    train_rows = read_manifest(result.train_manifest)
+    val_rows = read_manifest(result.val_manifest)
+    test_rows = read_manifest(result.test_manifest)
+    assert len(train_rows) == 4
+    assert len(val_rows) == 1
+    assert len(test_rows) == 1
+    assert {row["organ"] for row in train_rows + val_rows + test_rows} == {"unknown"}
+    assert {row["roi_id"] for row in train_rows}.isdisjoint(
+        {row["roi_id"] for row in val_rows}
+    )
+    assert all(row["roi_id_source"] == "filename_regex" for row in train_rows + val_rows)
+    assert test_rows[0]["dapi_path"] == "test/DAPI/ROI005_00_00.jpg"
+    assert not test_rows[0]["cd68_path"]
+    assert result.official_test_missing is False
