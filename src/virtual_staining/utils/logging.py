@@ -81,6 +81,20 @@ def _to_jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _without_per_image_records(value: Any) -> Any:
+    """Remove repeated validator rows from the portable lightweight log bundle."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_per_image_records(item)
+            for key, item in value.items()
+            if str(key) != "records"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_per_image_records(item) for item in value]
+    return value
+
+
 def _invocation_from_args(args: Any) -> dict[str, Any]:
     values = vars(args) if hasattr(args, "__dict__") else {}
     return {
@@ -263,7 +277,7 @@ class ExperimentLogSession:
     def record_epoch(self, entry: Mapping[str, Any]) -> None:
         """Persist a completed epoch immediately, including partial-run evidence."""
 
-        normalized = _to_jsonable(dict(entry))
+        normalized = _to_jsonable(_without_per_image_records(dict(entry)))
         if not isinstance(normalized, dict):
             raise TypeError("epoch entry must serialize to a mapping")
         self._epoch_entries.append(normalized)
@@ -303,7 +317,13 @@ class ExperimentLogSession:
             source = run_dir / relative
             if source.is_file():
                 destination = self.directory / destination_name
-                shutil.copy2(source, destination)
+                if relative == "metrics.json":
+                    _write_json(
+                        destination,
+                        _without_per_image_records(_read_json(source)),
+                    )
+                else:
+                    shutil.copy2(source, destination)
                 copied[relative] = destination_name
         _write_json(
             self.directory / "copied_artifacts.json",
@@ -315,7 +335,11 @@ class ExperimentLogSession:
         payload = _read_json(metrics_path)
         if not isinstance(payload, list):
             return list(self._epoch_entries)
-        return [dict(item) for item in payload if isinstance(item, Mapping)]
+        return [
+            dict(_without_per_image_records(item))
+            for item in payload
+            if isinstance(item, Mapping)
+        ]
 
     def _write_epoch_csv(self, history: list[dict[str, Any]]) -> None:
         if not history:

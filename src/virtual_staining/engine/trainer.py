@@ -75,6 +75,22 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
     return resolved
 
 
+def _without_validation_records(value: Any) -> Any:
+    """Drop repeated per-image rows while retaining aggregate validation evidence."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _without_validation_records(item)
+            for key, item in value.items()
+            if str(key) != "records"
+        }
+    if isinstance(value, list):
+        return [_without_validation_records(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_without_validation_records(item) for item in value)
+    return value
+
+
 def _resolve_amp_dtype(device: torch.device, requested: str) -> torch.dtype:
     normalized = requested.lower()
     if normalized in {"bfloat16", "bf16"}:
@@ -1165,6 +1181,14 @@ class Trainer:
         epochs_without_improvement = 0
         patience = max(0, int(config_get(self.config, "train.early_stopping_patience", 0) or 0))
         save_top_k = max(0, int(config_get(self.config, "train.save_top_k", 3) or 0))
+        checkpoint_metrics = {
+            str(value).strip().casefold()
+            for value in config_get(
+                self.config,
+                "train.checkpoint_metrics",
+                ["ssim", "psnr", "proxy"],
+            )
+        }
         # Validate every N epochs. Default 1 preserves the legacy behaviour of
         # validating every epoch. Screen runs may set a larger value to skip
         # validation on intermediate epochs; skipped epochs never update best
@@ -1172,6 +1196,13 @@ class Trainer:
         # always validated when a validator is provided.
         validate_every = max(
             1, int(config_get(self.config, "train.validate_every_n_epochs", 1) or 1)
+        )
+        retain_validation_records = bool(
+            config_get(
+                self.config,
+                "train.retain_validation_records_in_history",
+                True,
+            )
         )
         if output_dir is not None and start_epoch == 0:
             top_directory = output_dir / "top_k"
@@ -1240,8 +1271,16 @@ class Trainer:
                 entry["validation_duration_seconds"] = float(
                     time.perf_counter() - validation_start
                 )
-                entry["validation"] = validation
-                entry["validation_weight_sources"] = source_results
+                entry["validation"] = (
+                    validation
+                    if retain_validation_records
+                    else _without_validation_records(validation)
+                )
+                entry["validation_weight_sources"] = (
+                    source_results
+                    if retain_validation_records
+                    else _without_validation_records(source_results)
+                )
                 entry["selected_weight_source"] = selected_source
                 entry["validated"] = True
                 macro = validation.get("macro", {})
@@ -1395,7 +1434,10 @@ class Trainer:
                         ("psnr", "best_psnr.ckpt"),
                         ("proxy", "best_proxy.ckpt"),
                     ):
-                        if current[metric] > best[metric]:
+                        if (
+                            metric in checkpoint_metrics
+                            and current[metric] > best[metric]
+                        ):
                             best[metric] = current[metric]
                             save_checkpoint(output_dir / filename, self.model, **save_kwargs)
                     if save_top_k:

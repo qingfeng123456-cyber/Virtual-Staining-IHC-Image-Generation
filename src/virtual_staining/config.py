@@ -42,7 +42,8 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "prototype_diversity", "deep_supervision_weights", "task_weights",
         "auto_balance", "auto_balance_decay", "data_range", "mse", "pyramid",
         "statistics", "schedule", "phase_a_ratio", "phase_a", "phase_b",
-        "prototype", "shift_tolerant", "transition", "interpolation",
+        "prototype", "shift_tolerant", "fluorescence_foreground", "transition",
+        "interpolation",
     },
     "train": {
         "device", "hardware_profile", "resolved_hardware_profile", "epochs", "batch_size",
@@ -55,7 +56,8 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "progress_bar_refresh_seconds", "async_metric_logging",
         "batch_metric_log_interval", "validate_every_n_epochs",
         "float32_matmul_precision", "profiler", "compile",
-        "channels_last", "cudnn_benchmark",
+        "channels_last", "cudnn_benchmark", "retain_validation_records_in_history",
+        "checkpoint_metrics",
     },
     "validation": {
         "device", "task_name", "primary_metric", "psnr_norm_min", "psnr_norm_max",
@@ -167,6 +169,10 @@ _NESTED_ALLOWED: dict[tuple[str, str], set[str]] = {
     ("loss", "prototype"): {"activation", "diversity", "usage_entropy"},
     ("loss", "shift_tolerant"): {
         "enabled", "weight", "max_shift", "mode", "temperature",
+    },
+    ("loss", "fluorescence_foreground"): {
+        "enabled", "weight", "threshold_std_scale", "temperature", "mse_weight",
+        "dice_weight", "intensity_weight", "min_activity_std",
     },
 }
 
@@ -355,6 +361,32 @@ def validate_config(config: dict[str, Any]) -> None:
     async_logging = config["train"].get("async_metric_logging", False)
     if not isinstance(async_logging, bool):
         raise ConfigError("train.async_metric_logging must be boolean")
+    retain_validation_records = config["train"].get(
+        "retain_validation_records_in_history", True
+    )
+    if not isinstance(retain_validation_records, bool):
+        raise ConfigError(
+            "train.retain_validation_records_in_history must be boolean"
+        )
+    checkpoint_metrics = config["train"].get(
+        "checkpoint_metrics", ["ssim", "psnr", "proxy"]
+    )
+    if not isinstance(checkpoint_metrics, list) or not checkpoint_metrics:
+        raise ConfigError("train.checkpoint_metrics must be a non-empty list")
+    normalized_checkpoint_metrics = [
+        str(value).strip().casefold() for value in checkpoint_metrics
+    ]
+    if any(
+        value not in {"ssim", "psnr", "proxy"}
+        for value in normalized_checkpoint_metrics
+    ):
+        raise ConfigError(
+            "train.checkpoint_metrics accepts only ssim, psnr, and proxy"
+        )
+    if len(set(normalized_checkpoint_metrics)) != len(
+        normalized_checkpoint_metrics
+    ):
+        raise ConfigError("train.checkpoint_metrics cannot contain duplicates")
     log_interval = config["train"].get("batch_metric_log_interval", 0)
     if (
         isinstance(log_interval, bool)
@@ -399,6 +431,71 @@ def validate_config(config: dict[str, Any]) -> None:
     phase_a_ratio = float(config["loss"].get("phase_a_ratio", 0.7))
     if not 0.0 < phase_a_ratio < 1.0:
         raise ConfigError("loss.phase_a_ratio must be in (0, 1)")
+    foreground = config["loss"].get("fluorescence_foreground", {})
+    if foreground:
+        enabled = foreground.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ConfigError("loss.fluorescence_foreground.enabled must be boolean")
+        numeric_defaults = {
+            "weight": 0.0,
+            "threshold_std_scale": 0.25,
+            "temperature": 0.05,
+            "mse_weight": 1.0,
+            "dice_weight": 0.10,
+            "intensity_weight": 0.25,
+            "min_activity_std": 0.01,
+        }
+        numeric: dict[str, float] = {}
+        for key, default in numeric_defaults.items():
+            value = foreground.get(key, default)
+            if isinstance(value, bool):
+                raise ConfigError(
+                    f"loss.fluorescence_foreground.{key} must be numeric"
+                )
+            try:
+                numeric[key] = float(value)
+            except (TypeError, ValueError) as error:
+                raise ConfigError(
+                    f"loss.fluorescence_foreground.{key} must be numeric"
+                ) from error
+            if not math.isfinite(numeric[key]):
+                raise ConfigError(
+                    f"loss.fluorescence_foreground.{key} must be finite"
+                )
+        nonnegative = (
+            "weight",
+            "threshold_std_scale",
+            "mse_weight",
+            "dice_weight",
+            "intensity_weight",
+            "min_activity_std",
+        )
+        if any(numeric[key] < 0.0 for key in nonnegative):
+            raise ConfigError(
+                "loss.fluorescence_foreground weights, threshold scale, and "
+                "minimum activity must be nonnegative"
+            )
+        if numeric["temperature"] <= 0.0:
+            raise ConfigError(
+                "loss.fluorescence_foreground.temperature must be positive"
+            )
+        if enabled:
+            if str(config["loss"].get("schedule", "constant")).casefold() != "two_phase":
+                raise ConfigError(
+                    "loss.fluorescence_foreground requires loss.schedule=two_phase"
+                )
+            if numeric["weight"] <= 0.0:
+                raise ConfigError(
+                    "Enabled fluorescence foreground loss requires a positive weight"
+                )
+            if sum(
+                numeric[key]
+                for key in ("mse_weight", "dice_weight", "intensity_weight")
+            ) <= 0.0:
+                raise ConfigError(
+                    "Enabled fluorescence foreground loss requires a positive "
+                    "internal loss weight"
+                )
     channels_last_cfg = config["train"].get("channels_last", False)
     if not isinstance(channels_last_cfg, bool):
         raise ConfigError("train.channels_last must be boolean")

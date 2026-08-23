@@ -7,6 +7,10 @@ from .composite import (
     LossWeights,
     task_correlation_loss,
 )
+from .fluorescence_foreground import (
+    FluorescenceForegroundLoss,
+    FluorescenceForegroundOutput,
+)
 from .frequency import FrequencyAmplitudeLoss
 from .gradient import GradientLoss, sobel_gradients
 from .prototype import (
@@ -48,6 +52,8 @@ __all__ = [
     "CompositeRestorationLoss",
     "DifferentiableSSIM",
     "FrequencyAmplitudeLoss",
+    "FluorescenceForegroundLoss",
+    "FluorescenceForegroundOutput",
     "GradientLoss",
     "GaussianPyramidLoss",
     "IntensityStatisticsLoss",

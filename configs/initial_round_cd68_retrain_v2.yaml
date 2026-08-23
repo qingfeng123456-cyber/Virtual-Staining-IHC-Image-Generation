@@ -1,0 +1,114 @@
+# One-shot CD68 retraining candidate for the official initial-round data.
+#
+# Design constraints:
+# - retain the proven 16.2M-parameter NAF-style MultiMarkerRestorer;
+# - add only low-cost, target-derived protein-foreground supervision;
+# - align the late objective with the competition's SSIM/PSNR score;
+# - validate every three epochs to stay below the measured seven-hour budget;
+# - keep every new behavior reversible through this configuration file.
+project:
+  output_root: outputs/initial_round_v2
+  artifact_root: artifacts
+  seed: 2026
+
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+
+model:
+  name: multi_marker_restorer
+  base_channels: 64
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: false
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 0
+
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.35
+  interpolation: cosine
+  phase_a:
+    mse: 0.20
+    charbonnier: 0.40
+    ssim: 0.30
+    ms_ssim: 0.05
+    pyramid: 0.0
+    gradient: 0.05
+    statistics: 0.0
+  phase_b:
+    mse: 0.35
+    charbonnier: 0.25
+    ssim: 0.35
+    ms_ssim: 0.0
+    pyramid: 0.0
+    gradient: 0.03
+    statistics: 0.02
+  deep_supervision_weights: [1.0, 0.5, 0.25]
+  frequency: 0.0
+  correlation: 0.0
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+  fluorescence_foreground:
+    enabled: true
+    weight: 0.06
+    threshold_std_scale: 0.25
+    temperature: 0.05
+    mse_weight: 1.0
+    dice_weight: 0.10
+    intensity_weight: 0.25
+    min_activity_std: 0.01
+
+train:
+  epochs: 84
+  batch_size: 8
+  gradient_accumulation: 2
+  warmup_epochs: 4
+  amp: true
+  ema: true
+  ema_decay: 0.999
+  evaluate_weight_sources: [raw, ema]
+  early_stopping_patience: 8
+  save_top_k: 0
+  checkpoint_metrics: [ssim]
+  validate_every_n_epochs: 3
+  retain_validation_records_in_history: false
+  async_metric_logging: true
+  batch_metric_log_interval: 0
+
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: d4
+
+pretrain:
+  enabled: false
+
+multitask:
+  optimizer: equal
+  gradient_cosine_enabled: false
+
+submission:
+  official: true
+  allow_smoke_manifest: false

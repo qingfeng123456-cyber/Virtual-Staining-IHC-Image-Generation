@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
@@ -217,9 +218,8 @@ def _apply_hardware_defaults(config: dict[str, Any]) -> None:
             train["batch_size"] = profile["batch_size"]
         if train.get("gradient_accumulation") == "auto":
             train["gradient_accumulation"] = profile["gradient_accumulation"]
-        # The single rtx_5090 profile carries base_channels=64. Only override the
-        # model base_channels when it is still at the config default (48), so an
-        # explicit per-config base_channels is never clobbered.
+        # Only override model width when it is still at the config default, so
+        # an explicit per-config base_channels is never clobbered.
         if int(model.get("base_channels", 48)) == 48:
             model["base_channels"] = profile["base_channels"]
     if train.get("batch_size") == "auto":
@@ -330,7 +330,10 @@ def _build_loss(config: Mapping[str, Any]) -> nn.Module:
         shift_tolerant = (
             shift_tolerant if isinstance(shift_tolerant, Mapping) else {}
         )
+        foreground = loss_config.get("fluorescence_foreground", {})
+        foreground = foreground if isinstance(foreground, Mapping) else {}
         shift_enabled = bool(shift_tolerant.get("enabled", False))
+        foreground_enabled = bool(foreground.get("enabled", False))
         multitask_mode = str(config.get("multitask", {}).get("optimizer", "equal"))
         task_balancer = build_task_balancer(multitask_mode, _selected_targets(config))
         return ScheduledCompositeLoss(
@@ -376,6 +379,20 @@ def _build_loss(config: Mapping[str, Any]) -> nn.Module:
             shift_tolerant_mode=str(shift_tolerant.get("mode", "hard")),
             shift_tolerant_temperature=float(
                 shift_tolerant.get("temperature", 0.05)
+            ),
+            foreground_enabled=foreground_enabled,
+            foreground_weight=float(foreground.get("weight", 0.0)),
+            foreground_threshold_std_scale=float(
+                foreground.get("threshold_std_scale", 0.25)
+            ),
+            foreground_temperature=float(foreground.get("temperature", 0.05)),
+            foreground_mse_weight=float(foreground.get("mse_weight", 1.0)),
+            foreground_dice_weight=float(foreground.get("dice_weight", 0.10)),
+            foreground_intensity_weight=float(
+                foreground.get("intensity_weight", 0.25)
+            ),
+            foreground_min_activity_std=float(
+                foreground.get("min_activity_std", 0.01)
             ),
             data_range=float(loss_config.get("data_range", 1.0)),
         )
@@ -1621,16 +1638,42 @@ def command_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def _autodl_overrides(overrides: Sequence[str] | None) -> list[str]:
+    """Use parallel JPEG loading on Linux unless the user chose a worker count."""
+
+    resolved = list(overrides or [])
+    worker_is_explicit = any(
+        item.split("=", 1)[0].strip() == "data.num_workers"
+        for item in resolved
+        if "=" in item
+    )
+    if os.name != "nt" and not worker_is_explicit:
+        worker_count = max(1, min(8, (os.cpu_count() or 2) // 2))
+        resolved.extend(
+            [
+                f"data.num_workers={worker_count}",
+                "data.persistent_workers=true",
+            ]
+        )
+        logging.getLogger("virtual_staining").info(
+            "AutoDL Linux data loading enabled with %d workers. Override with "
+            "--set data.num_workers=N if needed.",
+            worker_count,
+        )
+    return resolved
+
+
 def command_autodl_run(args: argparse.Namespace) -> dict[str, Any]:
-    """One-command training + validation + log for AutoDL RTX 5090.
+    """One-command training + validation + log for AutoDL CUDA GPUs.
 
     Chains env -> discover-data -> build-manifest -> audit-data -> train(full
-    config epochs) -> validate(best_ssim raw+ema jpg) -> pipeline_report.json.
+    config epochs) -> validate(best selected weights in JPG) -> pipeline_report.json.
     The user only runs this single command; all internal steps and logging are
     handled automatically. Logs and artifacts land under log/<run-id>/ and
     outputs/<...>/<run-id>/.
     """
     report: dict[str, Any] = {"command": "autodl-run", "run_id": args.run_id}
+    effective_overrides = _autodl_overrides(args.set)
     # 1. Environment report (CUDA / GPU / PyTorch version sanity).
     report["environment"] = command_env(
         argparse.Namespace(output="artifacts/environment.json")
@@ -1643,7 +1686,7 @@ def command_autodl_run(args: argparse.Namespace) -> dict[str, Any]:
         output_path="artifacts/data_discovery.json",
     )
     report["discovery"] = discovery.to_dict()
-    base_config = load_config(args.config, args.set, include_resolved=False)
+    base_config = load_config(args.config, effective_overrides, include_resolved=False)
     pipeline_targets = _selected_targets(base_config)
     submit_targets = _submission_targets(base_config)
     if len(pipeline_targets) != 1 or len(submit_targets) != 1:
@@ -1655,9 +1698,9 @@ def command_autodl_run(args: argparse.Namespace) -> dict[str, Any]:
     manifests = _ensure_manifests(discovery, base_config)
     report["manifests"] = manifests.to_dict()
     report["audit"] = audit_data(discovery, workspace=Path.cwd()).to_dict()
-    # 3. Train with the full config (120 epoch by default for initial_round_cd68).
-    #    --max-epochs overrides train.epochs for a quick sanity run if needed.
-    config = load_config(args.config, args.set, include_resolved=True)
+    # 3. Train with the requested config. --max-epochs overrides train.epochs
+    #    for a quick sanity run if needed.
+    config = load_config(args.config, effective_overrides, include_resolved=True)
     if args.max_epochs is not None:
         config["train"]["epochs"] = int(args.max_epochs)
     report["train"] = _run_train(config, discovery.selected_root, args.run_id)
@@ -1667,7 +1710,7 @@ def command_autodl_run(args: argparse.Namespace) -> dict[str, Any]:
     report["validation"] = command_validate(
         argparse.Namespace(
             config=args.config,
-            set=args.set,
+            set=effective_overrides,
             target=pipeline_target,
             max_epochs=None,
             data_root=str(discovery.selected_root),
@@ -1700,6 +1743,7 @@ def command_autodl_submit(args: argparse.Namespace) -> dict[str, Any]:
     single command after autodl-run has produced a checkpoint.
     """
     report: dict[str, Any] = {"command": "autodl-submit"}
+    effective_overrides = _autodl_overrides(args.set)
     # 1. Resolve the checkpoint: explicit --checkpoint wins, else auto-detect
     #    the most recent best_ssim.ckpt under outputs/.
     if args.checkpoint:
@@ -1714,7 +1758,7 @@ def command_autodl_submit(args: argparse.Namespace) -> dict[str, Any]:
         config_path=args.config,
         output_path="artifacts/data_discovery.json",
     )
-    base_config = load_config(args.config, args.set, include_resolved=False)
+    base_config = load_config(args.config, effective_overrides, include_resolved=False)
     submit_targets = _submission_targets(base_config)
     if len(submit_targets) != 1:
         raise ValueError(
@@ -1730,7 +1774,7 @@ def command_autodl_submit(args: argparse.Namespace) -> dict[str, Any]:
     report["prediction"] = command_predict(
         argparse.Namespace(
             config=args.config,
-            set=args.set,
+            set=effective_overrides,
             target=pipeline_target,
             max_epochs=None,
             data_root=str(discovery.selected_root),
@@ -1744,7 +1788,7 @@ def command_autodl_submit(args: argparse.Namespace) -> dict[str, Any]:
     report["submission"] = command_make_submission(
         argparse.Namespace(
             config=args.config,
-            set=args.set,
+            set=effective_overrides,
             target=pipeline_target,
             max_epochs=None,
             pred_dir=str(prediction_dir),
@@ -3384,13 +3428,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     autodl_run = subparsers.add_parser(
         "autodl-run",
-        help="One-command training + validation + log for AutoDL RTX 5090",
+        help="One-command training + validation + log for AutoDL CUDA GPUs",
     )
     _add_config_arguments(autodl_run, target=True)
     autodl_run.add_argument("--run-id", default="autodl_run_seed2026")
     autodl_run.add_argument("--max-epochs", type=int, default=None)
     autodl_run.set_defaults(
-        handler=command_autodl_run, config="configs/initial_round_cd68.yaml"
+        handler=command_autodl_run,
+        config="configs/initial_round_cd68_retrain_v2.yaml",
     )
 
     autodl_submit = subparsers.add_parser(
@@ -3400,7 +3445,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arguments(autodl_submit, target=True)
     autodl_submit.add_argument("--checkpoint", default=None)
     autodl_submit.set_defaults(
-        handler=command_autodl_submit, config="configs/initial_round_cd68.yaml"
+        handler=command_autodl_submit,
+        config="configs/initial_round_cd68_retrain_v2.yaml",
     )
 
     benchmark = subparsers.add_parser(

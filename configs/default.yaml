@@ -86,6 +86,17 @@ loss:
   statistics: 0.0
   schedule: constant
   phase_a_ratio: 0.7
+  # Optional target-derived bright-protein supervision. It never uses test data
+  # and defaults off so legacy runs and checkpoints remain unchanged.
+  fluorescence_foreground:
+    enabled: false
+    weight: 0.0
+    threshold_std_scale: 0.25
+    temperature: 0.05
+    mse_weight: 1.0
+    dice_weight: 0.10
+    intensity_weight: 0.25
+    min_activity_std: 0.01
 
 train:
   device: auto
@@ -105,9 +116,11 @@ train:
   ema_decay: 0.999
   early_stopping_patience: 30
   save_top_k: 3
+  # Legacy default saves three best-metric aliases. Space-conscious runs may
+  # set [ssim]; last.ckpt is always retained for resume.
+  checkpoint_metrics: [ssim, psnr, proxy]
   resume: null
-  # RTX 5090 (Blackwell, 32GB, fixed 256x256 patches): cuDNN auto-tuner is safe
-  # and free, so disable deterministic algorithms and enable the auto-tuner.
+  # Fixed 256x256 patches allow cuDNN to reuse an optimized convolution plan.
   deterministic: false
   cudnn_benchmark: true
   max_oom_retries: 3
@@ -127,13 +140,16 @@ train:
   # set 5 to skip validation on intermediate epochs; skipped epochs never update
   # best checkpoints and are recorded as unvalidated.
   validate_every_n_epochs: 1
+  # False keeps aggregate metrics but omits repeated per-image validation rows
+  # from every checkpoint/history entry. Final validation still writes its own
+  # per-image CSV. True preserves the exact legacy checkpoint payload.
+  retain_validation_records_in_history: true
   # torch.set_float32_matmul_precision. Default "highest" preserves legacy
   # numerics; "high"/"medium" are A/B candidates on Ampere+ GPUs.
-  # torch.set_float32_matmul_precision. RTX 5090 (Blackwell) uses TF32 inner
-  # products with "high", a free throughput win with negligible numeric impact.
+  # CUDA Tensor Core GPUs can use TF32 inner products with "high".
   float32_matmul_precision: high
   # channels_last memory format for convolution-dense models on Tensor Core
-  # GPUs (Ampere+/Blackwell). The model and input tensors are converted to NHWC
+  # GPUs (Ampere+). The model and input tensors are converted to NHWC
   # so conv kernels hit the Tensor Core's 8-channel tile path. Safe for the
   # NAF/Restormer-lite stack (verified: all reshape/layer_norm paths are
   # channels_last-compatible).

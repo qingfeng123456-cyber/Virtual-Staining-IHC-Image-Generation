@@ -1,6 +1,6 @@
 # AutoDL 运行指南
 
-> 本文档是 AutoDL 上运行 CAMP-VS 项目的唯一入口。按顺序执行下面两条命令即可完成训练、验证和竞赛提交打包。
+> 本文档是 AutoDL 上运行本项目的推荐入口。旧 checkpoint 已遗失时，按顺序执行下面两条命令即可重新训练、验证并生成竞赛提交包。
 
 ## 前置准备（仅首次）
 
@@ -35,21 +35,22 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ```bash
 python -m virtual_staining.cli --log-root log autodl-run \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_retrain_v2.yaml \
   --data-root AUTO \
   --target CD68 \
-  --run-id cd68_autodl_seed2026
+  --run-id cd68_retrain_v2_seed2026
 ```
 
 **这条命令自动完成：**
 1. 环境检测（CUDA/GPU/PyTorch 版本）→ `artifacts/environment.json`
 2. 数据发现与 manifest 构建（train/val/test 自动划分）→ `artifacts/data_discovery.json`
 3. 数据审计（ROI 对齐、泄漏检查）→ `artifacts/data_audit.json`
-4. 训练 120 epoch（CAMP-VS v2 模型：base64 NAF 编码器 + Restormer-lite 6/6 mixer）
-5. 验证 best checkpoint（raw+ema，jpg 主域，三域指标 + ROI 分组）→ `validation/metrics.json`
-6. 写入汇总报告 → `outputs/initial_round/<run-id>/pipeline_report.json`
+4. 训练最多 84 epoch（16.2M 参数的 NAF 风格 MultiMarkerRestorer base64，不是更大的 Transformer）
+5. 每 3 epoch 比较 raw/EMA，并以最终 JPG round-trip SSIM 为主选择 checkpoint
+6. 训练结束比较无 TTA 与 D4 TTA，写入三域指标和 ROI 分组结果 → `validation/metrics.json`
+7. 写入汇总报告 → `outputs/initial_round_v2/<run-id>/pipeline_report.json`
 
-**预期耗时：** 约 6-10 小时（视 GPU 型号而定，4090 约 6 小时）。
+**预期耗时：** 根据上一轮 RTX 4090 实测日志估算约 4～5.5 小时；这是预算估算，不是已完成的新训练时长。模型或磁盘速度不同会改变耗时，但每 3 epoch 验证可明显减少验证占用。
 
 **快速验证（可选）：** 加 `--max-epochs 3` 跑 3 epoch 确认流程通畅，再跑完整训练。
 
@@ -58,7 +59,7 @@ python -m virtual_staining.cli --log-root log autodl-run \
 ```bash
 python -c "
 import json
-m = json.load(open('outputs/initial_round/cd68_autodl_seed2026/validation/metrics.json'))
+m = json.load(open('outputs/initial_round_v2/cd68_retrain_v2_seed2026/validation/metrics.json'))
 jpg = m['domains']['jpg']['macro']
 print('JPG SSIM:', round(jpg['mean_ssim'], 4))
 print('JPG PSNR:', round(jpg['mean_psnr'], 2))
@@ -70,10 +71,12 @@ print('ROI SSIM:', round(m['domains']['jpg']['macro']['roi_ssim'], 4))
 
 | 文件 | 内容 |
 | --- | --- |
-| `outputs/initial_round/<run-id>/validation/metrics.json` | 完整验证指标（float/uint8/jpg 三域，ROI 分组，分层） |
-| `outputs/initial_round/<run-id>/validation/per_image.csv` | 逐图 SSIM/PSNR |
-| `outputs/initial_round/<run-id>/pipeline_report.json` | 汇总报告（环境+训练+验证） |
-| `outputs/initial_round/<run-id>/checkpoints/best_ssim.ckpt` | 最佳 checkpoint |
+| `outputs/initial_round_v2/<run-id>/validation/metrics.json` | 完整验证指标（float/uint8/jpg 三域，ROI 分组，分层） |
+| `outputs/initial_round_v2/<run-id>/validation/per_image.csv` | 无 TTA 的逐图 SSIM/PSNR |
+| `outputs/initial_round_v2/<run-id>/validation/per_image_tta_d4.csv` | D4 TTA 的逐图 SSIM/PSNR |
+| `outputs/initial_round_v2/<run-id>/validation/tta_decisions.json` | 是否启用 D4 的验证集决策 |
+| `outputs/initial_round_v2/<run-id>/pipeline_report.json` | 汇总报告（环境+训练+验证） |
+| `outputs/initial_round_v2/<run-id>/checkpoints/best_ssim.ckpt` | 最佳 checkpoint |
 
 > **重要：** val SSIM/PSNR 是选择 checkpoint 的代理证据，**不是** official test 分数。official 分数只能由上传 ZIP 到竞赛平台后获得。
 
@@ -83,10 +86,10 @@ print('ROI SSIM:', round(m['domains']['jpg']['macro']['roi_ssim'], 4))
 
 ```bash
 python -m virtual_staining.cli --log-root log autodl-submit \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_retrain_v2.yaml \
   --data-root AUTO \
   --target CD68 \
-  --checkpoint outputs/initial_round/cd68_autodl_seed2026/checkpoints/best_ssim.ckpt
+  --checkpoint outputs/initial_round_v2/cd68_retrain_v2_seed2026/checkpoints/best_ssim.ckpt
 ```
 
 > **不要给 `autodl-submit` 添加 `--run-id`。** 当前 CLI 只有训练命令
@@ -105,7 +108,7 @@ python -m virtual_staining.cli --log-root log autodl-submit \
 最终 ZIP 在：
 
 ```
-outputs/initial_round/cd68_autodl_seed2026/submission/submission_CD68.zip
+outputs/initial_round_v2/cd68_retrain_v2_seed2026/submission/submission_CD68.zip
 ```
 
 将此 ZIP 上传到竞赛平台，平台返回的分数才是 official test score。
@@ -117,7 +120,7 @@ outputs/initial_round/cd68_autodl_seed2026/submission/submission_CD68.zip
 
 ```bash
 python -m virtual_staining.cli --log-root log autodl-submit \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_retrain_v2.yaml \
   --data-root AUTO \
   --target CD68
 ```
@@ -134,5 +137,27 @@ python -m virtual_staining.cli --log-root log autodl-submit \
 | OOM | 加 `--set train.batch_size=4 --set train.gradient_accumulation=4` |
 | 训练时报 run-id 已存在 | 给 `autodl-run` 换 `--run-id`，或确认后删除旧 run |
 | 提交时报 `unrecognized arguments: --run-id` | 删除 `autodl-submit` 后面的 `--run-id`，改用 `--checkpoint` |
-| 找不到 `best_ssim.ckpt` | 确认训练已完成，并检查 `outputs/initial_round/<run-id>/checkpoints/` |
-| 训练中途停止 | 检查 `pipeline_report.json` 的 `epochs_completed` 字段（早停 patience=30） |
+| 找不到 `best_ssim.ckpt` | 确认训练已完成，并检查 `outputs/initial_round_v2/<run-id>/checkpoints/` |
+| 训练中途停止 | 使用同一配置和 `resume` 命令加载 `last.ckpt`；不要从头覆盖已有 run |
+
+## 这次重训具体改了什么
+
+- 主模型仍是上一轮实际达到 JPG SSIM 0.805660、PSNR 26.04039 的 MultiMarkerRestorer base64；不会因追逐新论文而换成未经验证的大模型。
+- 使用连续两阶段 MSE/Charbonnier/SSIM 损失：前期学习稳定像素映射，后期增加 MSE 与 SSIM 对齐，兼顾竞赛的 SSIM 和 PSNR。
+- 新增小权重的荧光前景辅助损失，只从官方 train 标签动态产生软掩膜，强调 CD68 高表达区域；不会读取 test 标签或引入外部数据。
+- validation 从每轮一次改为每 3 轮一次；Linux 下自动启用最多 8 个 DataLoader worker，减轻上一轮 CPU 解码瓶颈。
+- checkpoint 和轻量日志不再为每个 epoch 重复保存 1,292 条逐图记录；最终逐图 CSV 仍完整保留。
+- 新配置只保留可续训的 `last.ckpt` 和用于提交的 `best_ssim.ckpt`，不再额外复制 best PSNR、best proxy 和 top-k 权重。
+
+这些改动是有文献依据的候选方案，但在新训练完成前不能声称已经涨分。判断是否提升，要把新 run 的 `validation/metrics.json` 与上一轮固定基线 JPG SSIM `0.805660`、PSNR `26.04039` 比较；最终仍以平台分数为准。
+
+## 论文依据与取舍
+
+- 赛事页面给出的本质是成对 DAPI→marker 图像转换，评分由 SSIM 与归一化 PSNR 组合，因此保留全图恢复损失，并显式加入 MSE/SSIM 后期对齐：[赛事任务与评分说明](https://www.aicomp.cn/tracks/tracks-1/3759.html)。
+- 2025 年 Spotlight 工作说明荧光前景监督能改善蛋白阳性结构，但也提示只追前景可能牺牲全图指标；本项目因此只加入 0.06 权重的辅助项，不替换全局损失：[Spotlight / foreground-aware virtual staining](https://pmc.ncbi.nlm.nih.gov/articles/PMC12265572/)。
+- 2026 年 PGVMS 强调 protein-aware distribution 与 prototype consistency；本工程原本已有 prototype，所以只借鉴“关注蛋白分布”的监督思想，不重复堆第二套原型网络：[PGVMS](https://arxiv.org/abs/2602.23292)。
+- ROSIE 在大规模共染数据上使用直接的 MSE 图像恢复目标，支持把显式 MSE 放回训练目标：[ROSIE, Nature Communications 2025](https://www.nature.com/articles/s41467-025-62346-0)。
+- 现有主干采用高效 NAF 风格块，上一轮已真实验证有效；因此没有在唯一一次重训中换成更大的 Transformer：[NAFNet 官方实现](https://github.com/megvii-research/NAFNet)。
+- DiffVS 的两阶段 latent diffusion 训练与外部依赖成本更高，不符合本轮单次、七小时内的稳健预算，所以未进入默认路径：[DiffVS 官方实现](https://github.com/hvcl/DiffVS)。
+
+以上是工程化改编，不代表复现了这些论文，也不代表在当前数据上已经获得论文所报告的提升。

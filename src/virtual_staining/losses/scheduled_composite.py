@@ -19,6 +19,7 @@ from .composite import (
     _zero_from_predictions,
     task_correlation_loss,
 )
+from .fluorescence_foreground import FluorescenceForegroundLoss
 from .frequency import FrequencyAmplitudeLoss
 from .gradient import GradientLoss
 from .prototype import PrototypeRegularization, prototype_usage_entropy_loss
@@ -166,6 +167,14 @@ class ScheduledCompositeLoss(nn.Module):
         shift_tolerant_max_shift: int = 1,
         shift_tolerant_mode: str = "hard",
         shift_tolerant_temperature: float = 0.05,
+        foreground_enabled: bool = False,
+        foreground_weight: float = 0.0,
+        foreground_threshold_std_scale: float = 0.25,
+        foreground_temperature: float = 0.05,
+        foreground_mse_weight: float = 1.0,
+        foreground_dice_weight: float = 0.10,
+        foreground_intensity_weight: float = 0.25,
+        foreground_min_activity_std: float = 0.01,
         data_range: float = 1.0,
     ) -> None:
         super().__init__()
@@ -183,6 +192,9 @@ class ScheduledCompositeLoss(nn.Module):
             "shift_tolerant": (
                 float(shift_tolerant_weight) if shift_tolerant_enabled else 0.0
             ),
+            "fluorescence_foreground": (
+                float(foreground_weight) if foreground_enabled else 0.0
+            ),
         }
         invalid_auxiliary = [
             name
@@ -195,6 +207,15 @@ class ScheduledCompositeLoss(nn.Module):
                 + ", ".join(invalid_auxiliary)
             )
         self.schedule = schedule or TwoPhaseLossSchedule()
+        endpoint_weights = (
+            asdict(self.schedule.phase_a),
+            asdict(self.schedule.phase_b),
+        )
+        self.active_reconstruction_terms = frozenset(
+            name
+            for name in endpoint_weights[0]
+            if any(endpoint[name] > 0.0 for endpoint in endpoint_weights)
+        )
         self.deep_supervision_weights = tuple(
             float(weight) for weight in deep_supervision_weights
         )
@@ -216,6 +237,18 @@ class ScheduledCompositeLoss(nn.Module):
                 temperature=shift_tolerant_temperature,
             )
             if shift_tolerant_enabled
+            else None
+        )
+        self.foreground_loss = (
+            FluorescenceForegroundLoss(
+                threshold_std_scale=foreground_threshold_std_scale,
+                temperature=foreground_temperature,
+                mse_weight=foreground_mse_weight,
+                dice_weight=foreground_dice_weight,
+                intensity_weight=foreground_intensity_weight,
+                min_activity_std=foreground_min_activity_std,
+            )
+            if foreground_enabled and foreground_weight > 0.0
             else None
         )
         self.task_balancer = task_balancer
@@ -267,14 +300,29 @@ class ScheduledCompositeLoss(nn.Module):
         with float32_context(prediction):
             prediction_float = prediction.float()
             target_float = target.float()
+            zero = prediction_float.sum() * 0.0
+            factories = {
+                "mse": lambda: F.mse_loss(prediction_float, target_float),
+                "charbonnier": lambda: self.charbonnier_loss(
+                    prediction_float, target_float
+                ),
+                "ssim": lambda: self.ssim_loss(prediction_float, target_float),
+                "ms_ssim": lambda: self.ms_ssim_loss(
+                    prediction_float, target_float
+                ),
+                "pyramid": lambda: self.pyramid_loss(
+                    prediction_float, target_float
+                ),
+                "gradient": lambda: self.gradient_loss(
+                    prediction_float, target_float
+                ),
+                "statistics": lambda: self.statistics_loss(
+                    prediction_float, target_float
+                ),
+            }
             return {
-                "mse": F.mse_loss(prediction_float, target_float),
-                "charbonnier": self.charbonnier_loss(prediction_float, target_float),
-                "ssim": self.ssim_loss(prediction_float, target_float),
-                "ms_ssim": self.ms_ssim_loss(prediction_float, target_float),
-                "pyramid": self.pyramid_loss(prediction_float, target_float),
-                "gradient": self.gradient_loss(prediction_float, target_float),
-                "statistics": self.statistics_loss(prediction_float, target_float),
+                name: factory() if name in self.active_reconstruction_terms else zero
+                for name, factory in factories.items()
             }
 
     def _deep_supervision_weight(self, index: int) -> float:
@@ -362,6 +410,7 @@ class ScheduledCompositeLoss(nn.Module):
         zero = _zero_from_predictions(predictions)
         frequency_values: list[Tensor] = []
         shift_values: list[Tensor] = []
+        foreground_values: list[Tensor] = []
         for task, prediction in predictions.items():
             target = self._aligned_full_target(prediction, aligned[task])
             frequency_value = (
@@ -379,9 +428,27 @@ class ScheduledCompositeLoss(nn.Module):
             )
             components[f"{task}/auxiliary/shift_tolerant"] = shift_value
             shift_values.append(shift_value)
+            if self.foreground_loss is not None:
+                foreground = self.foreground_loss(prediction, target)
+                foreground_value = foreground.total
+                components[f"{task}/auxiliary/foreground_mse"] = foreground.mse
+                components[f"{task}/auxiliary/foreground_dice"] = foreground.dice
+                components[f"{task}/auxiliary/foreground_intensity"] = (
+                    foreground.intensity
+                )
+                components[f"{task}/diagnostic/foreground_fraction"] = (
+                    foreground.foreground_fraction
+                )
+            else:
+                foreground_value = zero
+            components[f"{task}/auxiliary/fluorescence_foreground"] = (
+                foreground_value
+            )
+            foreground_values.append(foreground_value)
 
         frequency_value = torch.stack(frequency_values).mean()
         shift_value = torch.stack(shift_values).mean()
+        foreground_value = torch.stack(foreground_values).mean()
         correlation_value = (
             task_correlation_loss(predictions, aligned)
             if self.auxiliary_weights["correlation"] > 0.0
@@ -413,6 +480,7 @@ class ScheduledCompositeLoss(nn.Module):
             "prototype_diversity": prototype_diversity_value,
             "prototype_usage_entropy": prototype_usage_entropy_value,
             "shift_tolerant": shift_value,
+            "fluorescence_foreground": foreground_value,
         }
         auxiliary_total = zero
         for name, value in auxiliary_values.items():

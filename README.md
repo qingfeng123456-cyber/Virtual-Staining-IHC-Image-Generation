@@ -10,7 +10,7 @@
 - artifacts/ 中的 manifest、审计和环境报告由运行命令自动重新生成，不随 GitHub 仓库上传；
 - 真实训练产生的 outputs/、checkpoint 和提交结果默认被 .gitignore 排除。
 
-你不需要修改 Python 源码。初赛使用 configs/initial_round_cd68.yaml，完整命令见第 9、10 和 16 节。使用 AutoDL 训练、查看进度和下载可复盘日志，请直接阅读 [AutoDL 保姆级指南](docs/AUTODL_RUN.md)。
+你不需要修改 Python 源码。checkpoint 遗失后的推荐重训配置是 `configs/initial_round_cd68_retrain_v2.yaml`；`configs/initial_round_cd68.yaml` 仅保留为上一轮基线复现配置。完整命令见第 9、10 和 16 节。使用 AutoDL 训练、查看进度和下载可复盘日志，请直接阅读 [AutoDL 保姆级指南](docs/AUTODL_RUN.md)。
 
 ## 当前初赛数据审计结论
 
@@ -188,13 +188,13 @@ results/test/<TARGET>/<stem>_fake.jpg + ZIP
 - context 只能读取 DAPI，不能读取相邻标签；
 - 只有真实 ROI 网格、无邻域泄漏且 JPG 指标稳定提高后，相关模块才允许进入最终配置。
 
-第一次用初赛数据不要打开全部 V2 开关。正式初赛先使用：
+第一次用初赛数据不要打开全部 V2 开关。当前 checkpoint 已遗失，需要只重训一次时使用：
 
 ~~~text
-configs/initial_round_cd68.yaml
+configs/initial_round_cd68_retrain_v2.yaml
 ~~~
 
-它以保守的 MultiMarkerRestorer base32 为主线，保留三域验证和严格数据规则，且将 save_top_k 固定为 1；尚未完成真实 ROI 性能消融的 context、base/detail、预训练和高级集成保持关闭。
+它保留上一轮 16.2M 参数的 MultiMarkerRestorer base64 主线，加入可关闭的两阶段指标对齐损失和小权重荧光前景监督，并把验证间隔设为 3 epoch。未经真实 ROI 消融的 context、base/detail、预训练、扩散模型和高级集成仍然关闭，避免在唯一一次重训中引入过大风险。
 
 ### 3.4 损失与训练
 
@@ -209,6 +209,7 @@ configs/initial_round_cd68.yaml
 - EMA；
 - early stopping；
 - last、best 和 top-k checkpoint；
+- 新推荐重训配置为节省空间只保留 `last.ckpt` 与 `best_ssim.ckpt`；旧配置仍可保存全部 best/top-k；
 - optimizer、scheduler、scaler、EMA 与随机状态的完整恢复；
 - 只针对明确 CUDA OOM 的有限重试；
 - raw 与 EMA 分开验证，不假定 EMA 一定更好。
@@ -472,7 +473,7 @@ conda run -n MEDICAL python -m virtual_staining.cli discover-data --data-root AU
 ### 9.2 构建 manifest
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/initial_round_cd68.yaml --data-root AUTO
+conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO
 ~~~
 
 检查：
@@ -487,7 +488,7 @@ conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config conf
 
 ~~~powershell
 conda run -n MEDICAL python -m virtual_staining.cli audit-data --data-root dataset/official
-conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/initial_round_cd68.yaml --data-root AUTO --manifest artifacts/manifests/train_manifest.csv artifacts/manifests/val_manifest.csv --output-dir artifacts/performance_v2
+conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --manifest artifacts/manifests/train_manifest.csv artifacts/manifests/val_manifest.csv --output-dir artifacts/performance_v2
 ~~~
 
 至少确认图像可解码、尺寸/通道正确、配对完整、train/val 无泄漏、ROI 坐标解析正确。如果要启用 context，方向、边界连续性和 context gate 必须通过。
@@ -495,10 +496,10 @@ conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config conf
 ### 9.4 一轮 sanity train
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --run-id cd68_sanity --max-epochs 1 --set data.max_train_samples=16 --set data.max_val_samples=8 --set model.base_channels=8 --set train.gradient_accumulation=1 --set validation.bootstrap_samples=100 --set validation.save_visuals=false
+conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --target CD68 --run-id cd68_retrain_v2_sanity --max-epochs 1 --set data.max_train_samples=16 --set data.max_val_samples=8 --set model.base_channels=8 --set train.gradient_accumulation=1 --set validation.bootstrap_samples=100 --set validation.save_visuals=false --set inference.tta=none
 ~~~
 
-它只验证真实 Dataset、forward/backward、CUDA/AMP、checkpoint 和 validation。它不是正式训练结果。成功后可删除 outputs/initial_round/cd68_sanity/。
+它只验证真实 Dataset、forward/backward、CUDA/AMP、checkpoint、新损失和 validation。它不是正式训练结果。成功后可删除 `outputs/initial_round_v2/cd68_retrain_v2_sanity/`。
 
 上述真实数据 smoke 已实际通过。临时模型只训练了 16 张、验证了 8 张，因此它的 JPG SSIM 0.44854 / PSNR 10.0494 只能证明评分链路正常，不能当作正式初赛成绩。
 
@@ -507,25 +508,26 @@ conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initi
 ### 9.5 正式单目标训练
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --run-id cd68_initial_full_seed2026
+python -m virtual_staining.cli --log-root log autodl-run --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --target CD68 --run-id cd68_retrain_v2_seed2026
 ~~~
 
 保守配置默认：
 
-- MultiMarkerRestorer base32；
-- 120 epoch；
-- batch size 2、gradient accumulation 4；
+- MultiMarkerRestorer base64，约 16.2M 参数；
+- 最多 84 epoch，每 3 epoch 验证一次；
+- batch size 8、gradient accumulation 2；
 - AMP、EMA；
 - float、uint8、JPG 三域验证；
 - raw/EMA 分别比较；
-- context、D4 和未晋级 V2 模块关闭。
+- 连续两阶段 MSE/Charbonnier/SSIM 与小权重荧光前景辅助监督；
+- context、外部预训练、大 Transformer 和扩散模块关闭；训练结束后验证 D4 是否值得启用。
 
-8 GiB 显卡从这里开始。用正式数据第一个 epoch 的耗时估算总训练时间。
+这份配置针对上一轮实际使用的 24 GiB RTX 4090。8 GiB 显卡请覆盖为 `--set train.batch_size=2 --set train.gradient_accumulation=8`。上一轮日志推算新流程约 4～5.5 小时，但必须以新 run 实测为准。
 
 ### 9.6 断点续训
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli resume --config configs/initial_round_cd68.yaml --data-root AUTO --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/last.ckpt
+python -m virtual_staining.cli --log-root log resume --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --checkpoint outputs/initial_round_v2/cd68_retrain_v2_seed2026/checkpoints/last.ckpt
 ~~~
 
 恢复会检查目标、ImageSpec 和 manifest hash，并恢复 optimizer、scheduler、scaler、EMA、epoch 和随机状态。
@@ -533,7 +535,7 @@ conda run -n MEDICAL python -m virtual_staining.cli resume --config configs/init
 ### 9.7 验证
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli validate --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt
+python -m virtual_staining.cli --log-root log validate --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round_v2/cd68_retrain_v2_seed2026/checkpoints/best_ssim.ckpt
 ~~~
 
 这条命令会在完整 1,292 张本地 val 上计算分数。优先看输出中的 primary_domain=jpg、domains.jpg.macro.mean_ssim 和 mean_psnr，同时检查 float、uint8、raw 和 EMA。指标 JSON 和逐图 CSV 会写入对应 run 的 validation 目录。
@@ -549,15 +551,15 @@ conda run -n MEDICAL python -m virtual_staining.cli validate --config configs/in
 ### 10.1 推理
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli predict --config configs/initial_round_cd68.yaml --data-root AUTO --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt --manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir outputs/initial_round/cd68_initial_full_seed2026/predictions
+python -m virtual_staining.cli --log-root log autodl-submit --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round_v2/cd68_retrain_v2_seed2026/checkpoints/best_ssim.ckpt
 ~~~
 
-当前 test manifest 已确认有 1,346 行。命令成功后应报告 count=1346。它生成预测但不计算分数，因为 test 没有标签。
+当前 test manifest 已确认有 1,346 行。该一键命令会完成预测、提交打包和 ZIP 校验，成功后应报告 count=1346。它不能在本地计算 test 分数，因为 test 没有标签。
 
 ### 10.2 生成结果和 ZIP
 
 ~~~powershell
-conda run -n MEDICAL python -m virtual_staining.cli make-submission --config configs/initial_round_cd68.yaml --pred-dir outputs/initial_round/cd68_initial_full_seed2026/predictions --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir submission_ready
+python -m virtual_staining.cli make-submission --config configs/initial_round_cd68_retrain_v2.yaml --pred-dir outputs/initial_round_v2/cd68_retrain_v2_seed2026/predictions --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir submission_ready
 ~~~
 
 预期：
@@ -732,14 +734,11 @@ conda run -n MEDICAL python -m virtual_staining.cli --help
 $env:AIC_DATA_ROOT = (Resolve-Path .\dataset\official).Path
 
 conda run -n MEDICAL python -m virtual_staining.cli discover-data --data-root AUTO
-conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/initial_round_cd68.yaml --data-root AUTO
+conda run -n MEDICAL python -m virtual_staining.cli build-manifest --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO
 conda run -n MEDICAL python -m virtual_staining.cli audit-data --data-root dataset/official
-conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/initial_round_cd68.yaml --data-root AUTO --manifest artifacts/manifests/train_manifest.csv artifacts/manifests/val_manifest.csv --output-dir artifacts/performance_v2
-conda run -n MEDICAL python -m virtual_staining.cli train --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --run-id cd68_initial_full_seed2026
-conda run -n MEDICAL python -m virtual_staining.cli validate --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt
-conda run -n MEDICAL python -m virtual_staining.cli predict --config configs/initial_round_cd68.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round/cd68_initial_full_seed2026/checkpoints/best_ssim.ckpt --manifest artifacts/manifests/test_manifest.csv --output-dir outputs/initial_round/cd68_initial_full_seed2026/predictions
-conda run -n MEDICAL python -m virtual_staining.cli make-submission --config configs/initial_round_cd68.yaml --pred-dir outputs/initial_round/cd68_initial_full_seed2026/predictions --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --output-dir submission_ready
-conda run -n MEDICAL python -m virtual_staining.cli validate-submission --submission-dir submission_ready/results --test-manifest artifacts/manifests/test_manifest.csv --target CD68 --zip-path submission_ready/submission_CD68.zip --artifact-dir submission_ready/validation
+conda run -n MEDICAL python -m virtual_staining.cli audit-roi-grid --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --manifest artifacts/manifests/train_manifest.csv artifacts/manifests/val_manifest.csv --output-dir artifacts/performance_v2
+python -m virtual_staining.cli --log-root log autodl-run --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --target CD68 --run-id cd68_retrain_v2_seed2026
+python -m virtual_staining.cli --log-root log autodl-submit --config configs/initial_round_cd68_retrain_v2.yaml --data-root AUTO --target CD68 --checkpoint outputs/initial_round_v2/cd68_retrain_v2_seed2026/checkpoints/best_ssim.ckpt
 ~~~
 
 这套流程覆盖真实数据审计、训练、验证、test 推理、提交生成和 ZIP 校验。最终成绩仍取决于官方数据、完整训练、模型选择和赛事评分规则；任何未实际完成的长训练或 leaderboard 结果都不能提前声称。
