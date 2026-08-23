@@ -112,21 +112,47 @@ def extract_predictions(output: Any) -> dict[str, Tensor]:
     raise TypeError(f"Cannot extract predictions from output type {type(output).__name__}")
 
 
-def loss_total(loss_output: Any) -> tuple[Tensor, dict[str, float]]:
-    """Extract a scalar total and logging components from common loss APIs."""
+def loss_total(
+    loss_output: Any, *, keep_on_device: bool = False
+) -> tuple[Tensor, dict[str, Any]]:
+    """Extract a scalar total and logging components from common loss APIs.
+
+    When ``keep_on_device`` is ``False`` (default, legacy behaviour) the returned
+    component mapping holds Python floats; converting each scalar to a float
+    forces a CUDA->CPU synchronization per component, which on small batches can
+    starve the GPU. When ``keep_on_device`` is ``True`` the component values stay
+    as detached 0-dim ``Tensor``\\s on the loss device, so the caller can
+    accumulate statistics on-device and synchronize once at epoch end. The total
+    tensor is always returned as-is (on-device) so the caller can run backward.
+    """
     if isinstance(loss_output, Tensor):
-        return loss_output, {"loss": float(loss_output.detach().cpu())}
-    total = getattr(loss_output, "total", None)
-    components = getattr(loss_output, "components", {})
-    if total is None and isinstance(loss_output, Mapping):
-        total = loss_output.get("total", loss_output.get("loss"))
-        components = loss_output.get("components", {})
-    if total is None and isinstance(loss_output, (tuple, list)) and loss_output:
-        total = loss_output[0]
-        components = loss_output[1] if len(loss_output) > 1 else {}
-    if not isinstance(total, Tensor):
-        raise TypeError("Loss callable must return a Tensor or an object/mapping with Tensor total")
-    numeric: dict[str, float] = {"loss": float(total.detach().cpu())}
+        total = loss_output
+        components: Mapping[str, Any] = {}
+    else:
+        total = getattr(loss_output, "total", None)
+        components = getattr(loss_output, "components", {})
+        if total is None and isinstance(loss_output, Mapping):
+            total = loss_output.get("total", loss_output.get("loss"))
+            components = loss_output.get("components", {})
+        if total is None and isinstance(loss_output, (tuple, list)) and loss_output:
+            total = loss_output[0]
+            components = loss_output[1] if len(loss_output) > 1 else {}
+        if not isinstance(total, Tensor):
+            raise TypeError(
+                "Loss callable must return a Tensor or an object/mapping with Tensor total"
+            )
+    if keep_on_device:
+        numeric: dict[str, Any] = {"loss": total.detach()}
+        if isinstance(components, Mapping):
+            for key, value in components.items():
+                if isinstance(value, Tensor) and value.numel() == 1:
+                    numeric[str(key)] = value.detach()
+                elif isinstance(value, (int, float)):
+                    numeric[str(key)] = torch.as_tensor(
+                        float(value), dtype=total.dtype, device=total.device
+                    )
+        return total, numeric
+    numeric = {"loss": float(total.detach().cpu())}
     if isinstance(components, Mapping):
         for key, value in components.items():
             if isinstance(value, Tensor) and value.numel() == 1:
@@ -174,7 +200,14 @@ def call_model(
     supplied = dict(model_kwargs or {})
     if task_name is not None:
         supplied["task_name"] = task_name
-    signature = inspect.signature(model.forward)
+    try:
+        signature = inspect.signature(model.forward)
+    except (TypeError, ValueError):
+        # Some wrappers (e.g. torch.compile's OptimizedModule on some versions)
+        # do not expose an inspectable signature. Fall back to forwarding all
+        # supplied keywords and let the callable raise if it disagrees; this
+        # keeps compiled models usable without weakening the legacy path.
+        return model(inputs, **supplied)
     accepts_kwargs = any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()

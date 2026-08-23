@@ -1,0 +1,82 @@
+# T2 Transformer candidate (task book section 5.E.1): camp_vs_v2 + Restormer-lite,
+# double the T1 mixer depth.
+#
+# T2 = T1 with global_mixer blocks_1_8=2 and blocks_1_16=2 (heads and expansion
+# unchanged). This tests whether a deeper global mixer helps JPG roi_ssim beyond
+# T1, weighed against the extra compute/VRAM. context / cross-attention / MoE
+# remain disabled to keep isolating the global mixer.
+#
+# Promote T2 ONLY if T1 already showed a stable JPG improvement over T0 without
+# a prohibitive speed cost; running T2 before T1 is meaningful is wasteful. Use
+# the `train-v2` command. Record total parameters, peak VRAM and per-epoch time
+# in the AUTODL doc alongside JPG roi_ssim. All training is executed on AutoDL
+# only.
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+  seed: 2026
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+model:
+  name: camp_vs_v2
+  use_sobel_input: true
+  local_encoder: {type: naf, widths: [32, 64, 128, 256], depths: [2, 2, 4, 4], drop_path: 0.0}
+  context: {enabled: false, grid_size: 3, missing_policy: center, include_center: true, token_dim: 128, encoder_width: 24, context_dropout: 0.1, fusion_scales: [4, 8, 16], bottleneck_cross_attention: false, residual_init: 0.0, stop_gradient: false, require_verified_grid: true, coordinate_source: filename, allow_numeric_stem_inference: false, allow_edge_graph_inference: false, tile_chunk_size: 9}
+  global_mixer: {enabled: true, type: restormer_lite, blocks_1_8: 2, blocks_1_16: 2, heads: [2, 4], expansion: 2.0}
+  conditioning: {marker_embedding: true, organ_embedding: false, film: true, zero_init: true, embedding_dim: 128}
+  adapters: {marker: true, organ: false, mixture_of_experts: false, reduction: 4}
+  prototypes: {enabled: false, scales: [8, 16], shared_count: 8, marker_count: 8, organ_count: 0, dim: 128, temperature: 0.1, residual_init: 0.0, reset_dead: false, dead_threshold: 0.0001}
+  output: {base_detail: true, max_detail_amplitude: 1.0, deep_supervision: true, deep_supervision_scales: [1, 2, 4, 8]}
+  intensity_calibrator: {enabled: true, max_gain_delta: 0.15, max_bias: 0.15}
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.7
+  phase_a: {mse: 0.10, charbonnier: 0.35, ssim: 0.30, ms_ssim: 0.10, pyramid: 0.10, gradient: 0.03, statistics: 0.02}
+  phase_b: {mse: 0.35, charbonnier: 0.15, ssim: 0.35, ms_ssim: 0.05, pyramid: 0.07, gradient: 0.02, statistics: 0.01}
+train:
+  device: cuda
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw, ema]
+  save_top_k: 1
+  async_metric_logging: false
+  batch_metric_log_interval: 0
+  validate_every_n_epochs: 1
+  float32_matmul_precision: highest
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  compile:
+    enabled: false
+    mode: default
+    backend: inductor
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+submission:
+  official: true
+  allow_smoke_manifest: false
+budget:
+  active: full

@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
+dev = ["ruff>=0.9,<1"]
 
 [project.scripts]
 virtual-staining = "virtual_staining.cli:main"
@@ -34,10 +34,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-ra"
 
 [tool.ruff]
 target-version = "py310"

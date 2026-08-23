@@ -1,0 +1,45 @@
+# T3 Transformer candidate for RTX 5090 (32GB Blackwell).
+#
+# T3 = camp_vs_v2 with a WIDER base64 NAF encoder and a DEEPER Restormer-lite
+# global mixer, sized to fill the 5090:
+#   local_encoder.widths: [64, 128, 256, 512]  (vs T1/T2's [32,64,128,256])
+#   local_encoder.depths: [4, 4, 6, 6]
+#   global_mixer.blocks_1_8:  4   (channel attention, O(C^2*HW), GPU-friendly)
+#   global_mixer.blocks_1_16: 4
+#   global_mixer.heads: [4, 8]
+#
+# context / cross-attention / mixture-of-experts are ALL disabled to isolate
+# the global mixer's effect on local restoration (no neighborhood tiles).
+#
+# Batch is set to 4 with accumulation 4 (effective 16) as a conservative
+# starting point against OOM on the larger base64 encoder; raise to 8 once a
+# profiler run on AutoDL confirms peak VRAM has headroom. The 5090 GPU-util
+# flags (channels_last, cudnn_benchmark, TF32, num_workers=8) are inherited from
+# configs/default.yaml.
+#
+# This run uses the `train-v2` command (camp_vs_v2 requires it). Record total
+# parameter count, peak VRAM and per-epoch time alongside JPG roi_ssim so any
+# quality gain is weighed against compute cost. All training is executed on
+# AutoDL only; nothing here is a measured result.
+project: {output_root: outputs/performance_v2, artifact_root: artifacts/performance_v2}
+data: {targets: [CD68], submit_targets: [CD68]}
+model:
+  name: camp_vs_v2
+  use_sobel_input: true
+  local_encoder: {type: naf, widths: [64, 128, 256, 512], depths: [4, 4, 6, 6], drop_path: 0.0}
+  context: {enabled: false, grid_size: 3, missing_policy: center, include_center: true, token_dim: 128, encoder_width: 24, context_dropout: 0.1, fusion_scales: [4, 8, 16], bottleneck_cross_attention: false, residual_init: 0.0, stop_gradient: false, require_verified_grid: true, coordinate_source: filename, allow_numeric_stem_inference: false, allow_edge_graph_inference: false, tile_chunk_size: 9}
+  global_mixer: {enabled: true, type: restormer_lite, blocks_1_8: 4, blocks_1_16: 4, heads: [4, 8], expansion: 2.0}
+  conditioning: {marker_embedding: true, organ_embedding: false, film: true, zero_init: true, embedding_dim: 128}
+  adapters: {marker: true, organ: false, mixture_of_experts: false, reduction: 4}
+  prototypes: {enabled: false, scales: [8, 16], shared_count: 8, marker_count: 8, organ_count: 0, dim: 128, temperature: 0.1, residual_init: 0.0, reset_dead: false, dead_threshold: 0.0001}
+  output: {base_detail: true, max_detail_amplitude: 1.0, deep_supervision: true, deep_supervision_scales: [1, 2, 4, 8]}
+  intensity_calibrator: {enabled: true, max_gain_delta: 0.15, max_bias: 0.15}
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.7
+  phase_a: {mse: 0.10, charbonnier: 0.35, ssim: 0.30, ms_ssim: 0.10, pyramid: 0.10, gradient: 0.03, statistics: 0.02}
+  phase_b: {mse: 0.35, charbonnier: 0.15, ssim: 0.35, ms_ssim: 0.05, pyramid: 0.07, gradient: 0.02, statistics: 0.01}
+
+train: {epochs: 120, batch_size: 4, gradient_accumulation: 4}
+validation: {primary_domain: jpg, domains: [float, uint8, jpg], group_by_roi: true, bootstrap_by_roi: true, bootstrap_samples: 1000, save_predictions: true}
+budget: {active: full}

@@ -8,6 +8,7 @@ import csv
 import hashlib
 import inspect
 import json
+import logging
 import math
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -103,7 +104,12 @@ from virtual_staining.models import (
 from virtual_staining.models.dapi_mae import DAPIMaskedAutoencoder
 from virtual_staining.submission import build_submission, validate_submission
 from virtual_staining.utils.device import environment_report, hardware_profile
-from virtual_staining.utils.logging import configure_logging
+from virtual_staining.utils.logging import (
+    ExperimentLogSession,
+    activate_experiment_log,
+    active_experiment_log,
+    configure_logging,
+)
 from virtual_staining.utils.seed import seed_worker, set_seed
 
 
@@ -211,7 +217,10 @@ def _apply_hardware_defaults(config: dict[str, Any]) -> None:
             train["batch_size"] = profile["batch_size"]
         if train.get("gradient_accumulation") == "auto":
             train["gradient_accumulation"] = profile["gradient_accumulation"]
-        if int(model.get("base_channels", 48)) == 48 and profile["name"] == "gpu_8gb":
+        # The single rtx_5090 profile carries base_channels=64. Only override the
+        # model base_channels when it is still at the config default (48), so an
+        # explicit per-config base_channels is never clobbered.
+        if int(model.get("base_channels", 48)) == 48:
             model["base_channels"] = profile["base_channels"]
     if train.get("batch_size") == "auto":
         train["batch_size"] = 1
@@ -472,6 +481,7 @@ def _make_loader(
     generator = set_seed(
         int(config["project"].get("seed", 2026)),
         deterministic=bool(train_config.get("deterministic", True)),
+        benchmark=train_config.get("cudnn_benchmark", None),
     )
     workers = int(data.get("num_workers", 0))
     persistent = bool(data.get("persistent_workers", False)) and workers > 0
@@ -804,6 +814,7 @@ def _run_train(
     initial_strict: bool = True,
     stage: str | None = None,
 ) -> dict[str, Any]:
+    logger = logging.getLogger("virtual_staining")
     if initial_checkpoint is not None and pretrain_checkpoint is not None:
         raise ValueError(
             "An initial restoration checkpoint and a DAPI pretraining checkpoint "
@@ -814,9 +825,11 @@ def _run_train(
         config["train"]["stage"] = stage
     targets = _selected_targets(config)
     config["train"]["task_name"] = targets[0] if len(targets) == 1 else None
+    logger.info("Preparing training data and model for target(s): %s", ", ".join(targets))
     discovery = _resolve_discovery(data_root, config=config)
     root = discovery.selected_root
     config["data"]["root"] = str(root)
+    logger.info("Using data root: %s", root)
     manifests = _ensure_manifests(root, config)
     context_options = config.get("model", {}).get("context", {})
     if isinstance(context_options, Mapping) and bool(context_options.get("enabled", False)):
@@ -843,6 +856,7 @@ def _run_train(
         )
     config["project"]["run_id"] = run_id
     save_effective_config(config, run_dir / "effective_config.yaml")
+    logger.info("Building datasets, loaders, model, optimizer, and validator")
     trainer, validator, model, _, _ = _prepare_training(config, root, manifests, run_dir)
     save_effective_config(config, run_dir / "effective_config.yaml")
     initialization: dict[str, Any] | None = None
@@ -935,6 +949,7 @@ def _run_train(
             .unsqueeze(0)
             .to(device=trainer.device),
         }
+    logger.info("Measuring model size and compute; batch progress starts immediately after this step")
     stats = model_statistics(
         model,
         (1, input_channels, image_size, image_size),
@@ -942,7 +957,17 @@ def _run_train(
         forward_kwargs=statistics_kwargs,
     )
     _write_json(run_dir / "model_stats.json", stats)
+    log_session = active_experiment_log()
+    if log_session is not None:
+        log_session.bind_training_run(
+            run_dir,
+            config=config,
+            model=model,
+            model_stats=stats,
+        )
+        trainer.add_epoch_callback(log_session.record_epoch)
     train_manifest_hash = trainer.training_manifest_hash
+    logger.info("Preparation complete. Starting batch-by-batch training progress now")
     history = trainer.fit(
         epochs=int(config["train"].get("epochs", 1)),
         validator=validator,
@@ -1130,6 +1155,21 @@ def command_resume(args: argparse.Namespace) -> dict[str, Any]:
             if not saved_hash or saved_hash != current_hash:
                 raise ValueError("Checkpoint grouped-fold assignment does not match current fold")
     start_epoch = int(resumed["start_epoch"])
+    log_session = active_experiment_log()
+    if log_session is not None:
+        stats_path = run_dir / "model_stats.json"
+        model_stats = (
+            json.loads(stats_path.read_text(encoding="utf-8"))
+            if stats_path.is_file()
+            else None
+        )
+        log_session.bind_training_run(
+            run_dir,
+            config=config,
+            model=model,
+            model_stats=model_stats,
+        )
+        trainer.add_epoch_callback(log_session.record_epoch)
     history = trainer.fit(
         epochs=int(config["train"].get("epochs", start_epoch + 1)),
         start_epoch=start_epoch,
@@ -1581,6 +1621,157 @@ def command_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def command_autodl_run(args: argparse.Namespace) -> dict[str, Any]:
+    """One-command training + validation + log for AutoDL RTX 5090.
+
+    Chains env -> discover-data -> build-manifest -> audit-data -> train(full
+    config epochs) -> validate(best_ssim raw+ema jpg) -> pipeline_report.json.
+    The user only runs this single command; all internal steps and logging are
+    handled automatically. Logs and artifacts land under log/<run-id>/ and
+    outputs/<...>/<run-id>/.
+    """
+    report: dict[str, Any] = {"command": "autodl-run", "run_id": args.run_id}
+    # 1. Environment report (CUDA / GPU / PyTorch version sanity).
+    report["environment"] = command_env(
+        argparse.Namespace(output="artifacts/environment.json")
+    )
+    # 2. Discover the official data root and build leakage-aware manifests.
+    discovery = discover_data_root(
+        args.data_root,
+        workspace=Path.cwd(),
+        config_path=args.config,
+        output_path="artifacts/data_discovery.json",
+    )
+    report["discovery"] = discovery.to_dict()
+    base_config = load_config(args.config, args.set, include_resolved=False)
+    pipeline_targets = _selected_targets(base_config)
+    submit_targets = _submission_targets(base_config)
+    if len(pipeline_targets) != 1 or len(submit_targets) != 1:
+        raise ValueError(
+            "autodl-run requires exactly one configured prediction target "
+            f"(got targets={pipeline_targets}, submit_targets={submit_targets})"
+        )
+    pipeline_target = submit_targets[0]
+    manifests = _ensure_manifests(discovery, base_config)
+    report["manifests"] = manifests.to_dict()
+    report["audit"] = audit_data(discovery, workspace=Path.cwd()).to_dict()
+    # 3. Train with the full config (120 epoch by default for initial_round_cd68).
+    #    --max-epochs overrides train.epochs for a quick sanity run if needed.
+    config = load_config(args.config, args.set, include_resolved=True)
+    if args.max_epochs is not None:
+        config["train"]["epochs"] = int(args.max_epochs)
+    report["train"] = _run_train(config, discovery.selected_root, args.run_id)
+    run_dir = Path(report["train"]["run_dir"])
+    best = Path(report["train"]["best_ssim_checkpoint"])
+    # 4. Validate the best checkpoint on the val split with raw+ema + jpg domain.
+    report["validation"] = command_validate(
+        argparse.Namespace(
+            config=args.config,
+            set=args.set,
+            target=pipeline_target,
+            max_epochs=None,
+            data_root=str(discovery.selected_root),
+            checkpoint=str(best),
+        )
+    )
+    # 5. Write a single consolidated report so the user can inspect everything
+    #    from one file under log/<run-id>/ without hunting for sub-logs.
+    report_path = run_dir / "pipeline_report.json"
+    _write_json(report_path, report)
+    report["report_path"] = str(report_path)
+    report["best_checkpoint"] = str(best)
+    report["validation_metrics"] = str(run_dir / "validation" / "metrics.json")
+    logger = logging.getLogger("virtual_staining")
+    logger.info(
+        "autodl-run complete | run_dir=%s | best=%s | validation=%s",
+        run_dir,
+        best,
+        report["validation_metrics"],
+    )
+    return report
+
+
+def command_autodl_submit(args: argparse.Namespace) -> dict[str, Any]:
+    """One-command predict + make-submission + validate-submission -> ZIP.
+
+    Resolves the best checkpoint (auto or --checkpoint), runs deterministic
+    inference on the official test manifest, builds the competition results
+    hierarchy and ZIP, then strictly validates the ZIP. The user only runs this
+    single command after autodl-run has produced a checkpoint.
+    """
+    report: dict[str, Any] = {"command": "autodl-submit"}
+    # 1. Resolve the checkpoint: explicit --checkpoint wins, else auto-detect
+    #    the most recent best_ssim.ckpt under outputs/.
+    if args.checkpoint:
+        checkpoint = Path(args.checkpoint).expanduser().resolve()
+    else:
+        checkpoint = _auto_checkpoint()
+    report["checkpoint"] = str(checkpoint)
+    # 2. Discover data + manifests to get the official test manifest path.
+    discovery = discover_data_root(
+        args.data_root,
+        workspace=Path.cwd(),
+        config_path=args.config,
+        output_path="artifacts/data_discovery.json",
+    )
+    base_config = load_config(args.config, args.set, include_resolved=False)
+    submit_targets = _submission_targets(base_config)
+    if len(submit_targets) != 1:
+        raise ValueError(
+            "autodl-submit requires exactly one submit target "
+            f"(got {submit_targets})"
+        )
+    pipeline_target = submit_targets[0]
+    manifests = _ensure_manifests(discovery, base_config)
+    test_manifest = manifests.test_manifest
+    # 3. Predict the official test set (DAPI-only, no labels).
+    run_dir = checkpoint.parent.parent
+    prediction_dir = run_dir / "predictions"
+    report["prediction"] = command_predict(
+        argparse.Namespace(
+            config=args.config,
+            set=args.set,
+            target=pipeline_target,
+            max_epochs=None,
+            data_root=str(discovery.selected_root),
+            checkpoint=str(checkpoint),
+            manifest=str(test_manifest),
+            output_dir=str(prediction_dir),
+        )
+    )
+    # 4. Build the competition results/ hierarchy and ZIP.
+    submission_root = run_dir / "submission"
+    report["submission"] = command_make_submission(
+        argparse.Namespace(
+            config=args.config,
+            set=args.set,
+            target=pipeline_target,
+            max_epochs=None,
+            pred_dir=str(prediction_dir),
+            test_manifest=str(test_manifest),
+            output_dir=str(submission_root),
+            submit_target=True,
+        )
+    )
+    # 5. Strictly validate the ZIP (file names, count, size, mode).
+    report["submission_validation"] = validate_submission(
+        submission_root / "results",
+        test_manifest,
+        pipeline_target,
+        zip_path=report["submission"]["zip_path"],
+        artifact_dir=run_dir / "artifacts",
+        expected_mode=_expected_target_mode(pipeline_target),
+    )
+    report["zip_path"] = report["submission"]["zip_path"]
+    logger = logging.getLogger("virtual_staining")
+    logger.info(
+        "autodl-submit complete | zip=%s | checkpoint=%s",
+        report["zip_path"],
+        checkpoint,
+    )
+    return report
+
+
 def _auto_checkpoint() -> Path:
     candidates = sorted(
         Path("outputs").glob("**/best_ssim.ckpt"),
@@ -1793,6 +1984,10 @@ def command_pretrain_dapi(args: argparse.Namespace) -> dict[str, Any]:
         learning_rate=float(pretrain.get("lr", config["train"].get("lr", 2e-4))),
         weight_decay=float(config["train"].get("weight_decay", 1e-4)),
         amp=bool(config["train"].get("amp", True)),
+        progress_bar=config["train"].get("progress_bar", "auto"),
+        progress_bar_refresh_seconds=float(
+            config["train"].get("progress_bar_refresh_seconds", 1.0)
+        ),
     )
     image_size = int(config["data"].get("image_size", 256))
     stats = model_statistics(
@@ -3097,6 +3292,11 @@ def _add_config_arguments(parser: argparse.ArgumentParser, *, target: bool = Fal
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="virtual_staining", description=__doc__)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--log-root",
+        default="log",
+        help="Root directory for lightweight downloadable experiment logs",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     env_parser = subparsers.add_parser("env", help="Report Python, PyTorch, CUDA, GPU, CPU, and RAM")
@@ -3181,6 +3381,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arguments(pipeline)
     pipeline.add_argument("--run-id", default="smoke_pipeline_acceptance")
     pipeline.set_defaults(handler=command_pipeline, config="configs/smoke.yaml")
+
+    autodl_run = subparsers.add_parser(
+        "autodl-run",
+        help="One-command training + validation + log for AutoDL RTX 5090",
+    )
+    _add_config_arguments(autodl_run, target=True)
+    autodl_run.add_argument("--run-id", default="autodl_run_seed2026")
+    autodl_run.add_argument("--max-epochs", type=int, default=None)
+    autodl_run.set_defaults(
+        handler=command_autodl_run, config="configs/initial_round_cd68.yaml"
+    )
+
+    autodl_submit = subparsers.add_parser(
+        "autodl-submit",
+        help="One-command predict + make-submission + validate-submission -> ZIP",
+    )
+    _add_config_arguments(autodl_submit, target=True)
+    autodl_submit.add_argument("--checkpoint", default=None)
+    autodl_submit.set_defaults(
+        handler=command_autodl_submit, config="configs/initial_round_cd68.yaml"
+    )
 
     benchmark = subparsers.add_parser(
         "benchmark-baseline", help="Freeze and re-evaluate raw/EMA baseline weights in three domains"
@@ -3395,15 +3616,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    logger = configure_logging(verbose=bool(args.verbose))
-    try:
-        result = args.handler(args)
-    except KeyboardInterrupt:
-        logger.error("Interrupted by user")
-        return 130
-    except Exception as error:
-        logger.exception("Command failed: %s", error)
-        return 1
+    session = ExperimentLogSession.from_args(args)
+    logger = configure_logging(session.console_path, verbose=bool(args.verbose))
+    logger.info("Command log directory: %s", session.directory)
+    with activate_experiment_log(session):
+        try:
+            result = args.handler(args)
+        except KeyboardInterrupt as error:
+            logger.error("Interrupted by user")
+            session.fail(error)
+            return 130
+        except Exception as error:
+            logger.exception("Command failed: %s", error)
+            session.fail(error)
+            return 1
+    if isinstance(result, Mapping):
+        enriched_result = dict(result)
+        enriched_result.update(session.complete(enriched_result))
+        result = enriched_result
+    else:
+        session.complete({"result": _json_safe(result)})
     _print_json(result)
     return 0
 

@@ -7,10 +7,10 @@
 - 数据位于 dataset/official/，约 188 MiB；
 - train 有 DAPI 和四个目标 marker，test 只有 DAPI；
 - 开发阶段的样例数据、样例权重、失败实验权重和旧预测已经删除；
-- artifacts/ 中保留的是当前初赛数据的 manifest、审计和小型验收报告；
+- artifacts/ 中的 manifest、审计和环境报告由运行命令自动重新生成，不随 GitHub 仓库上传；
 - 真实训练产生的 outputs/、checkpoint 和提交结果默认被 .gitignore 排除。
 
-你不需要修改 Python 源码。初赛使用 configs/initial_round_cd68.yaml，完整命令见第 9、10 和 16 节。
+你不需要修改 Python 源码。初赛使用 configs/initial_round_cd68.yaml，完整命令见第 9、10 和 16 节。使用 AutoDL 训练、查看进度和下载可复盘日志，请直接阅读 [AutoDL 保姆级指南](docs/AUTODL_RUN.md)。
 
 ## 当前初赛数据审计结论
 
@@ -144,7 +144,8 @@ results/test/<TARGET>/<stem>_fake.jpg + ZIP
 | docs/ | 模型、实验、提交和 V2 技术文档 |
 | dataset/ | 赛事真实数据；当前初赛包位于 dataset/official/，约 188 MiB |
 | artifacts/ | 运行后生成 manifest、数据审计和指标 |
-| outputs/ | 运行后生成 checkpoint、日志和预测 |
+| outputs/ | 运行后生成 checkpoint 和预测 |
+| log/ | 每次命令自动生成的轻量实验日志和可下载 ZIP；不包含 checkpoint |
 | results/ | 正式提交结果 |
 
 ### 3.2 数据层
@@ -331,6 +332,27 @@ conda run -n MEDICAL python -m virtual_staining.cli env
 ~~~
 
 确认 CUDA 可用、GPU 名称正确、torch.version.cuda 不是 None，并查看 BF16/FP16 和显存。
+
+### 6.3 AutoDL 日志回传
+
+所有 CLI 命令默认在项目根目录创建 log 文件夹。训练 run 例如 cd68_initial_full_seed2026 会生成：
+
+~~~text
+log/cd68_initial_full_seed2026/
+├─ train.log
+├─ environment.json
+├─ effective_config.yaml
+├─ module_inventory.json
+├─ epoch_metrics.jsonl
+├─ epoch_metrics.csv
+├─ performance_summary.json
+├─ validation_metrics.json
+└─ train_log_bundle.zip
+~~~
+
+在交互式终端中运行 train 或 pretrain-v2 时，程序会自动显示逐 batch 进度条：当前 epoch、已完成 batch、loss、图像/秒、学习率，以及 CUDA 时的峰值显存。默认 `train.progress_bar: auto` 只在真正的终端中显示它，避免把 `nohup` 的重定向日志写成难读的动态控制字符。日志仍包含每 epoch 的 loss、吞吐、峰值显存、进程内存、OOM 重试次数、三域验证指标和模块参数量，但不复制大体积 checkpoint 或预测图片。完成远程训练后下载 train_log_bundle.zip，解压到本机项目的 log/，再让我读取分析即可。
+
+完整的上传、sanity train、后台正式训练、查看 GPU、下载 ZIP、推理、提交和续训步骤见 [AutoDL 保姆级指南](docs/AUTODL_GUIDE.md)。
 
 ---
 

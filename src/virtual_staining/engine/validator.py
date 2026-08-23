@@ -145,6 +145,14 @@ class Validator:
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA validation was requested but CUDA is unavailable")
         self.model = model.to(self.device)
+        # channels_last must match the trainer's setting: if the model was
+        # compiled/converted with channels_last during training, validation inputs
+        # must also be channels_last for the conv kernels to use the NHWC path.
+        # The model is shared with the trainer instance, so its parameters are
+        # already channels_last; we only need to convert the input tensors here.
+        self.channels_last_enabled = bool(
+            config_get(config, "train.channels_last", False)
+        ) and self.device.type == "cuda"
         self.dataloader = dataloader
         self.config = config
         self.ema = ema
@@ -348,6 +356,13 @@ class Validator:
                     if not targets:
                         raise ValueError("Validation batch contains no target tensors")
                     inputs = move_to_device(inputs, self.device)
+                    if (
+                        self.channels_last_enabled
+                        and isinstance(inputs, torch.Tensor)
+                        and inputs.ndim == 4
+                        and torch.is_floating_point(inputs)
+                    ):
+                        inputs = inputs.to(memory_format=torch.channels_last)
                     targets = move_to_device(targets, self.device)
                     metadata = move_to_device(metadata, self.device)
                     effective_task = self.task_name

@@ -1,0 +1,97 @@
+# A3 validation candidate (task book section 6.2 and section 5.C): single-variable
+# change vs A0.
+#
+# Delta vs perf_a0_baseline.yaml:
+#   train.validate_every_n_epochs: 1 -> 5
+#   train.evaluate_weight_sources: [raw, ema] -> [raw]
+#
+# Hypothesis: A0 validates the full 1292-image val set TWICE (raw + ema) every
+# epoch, each pass encoding JPEG for three domains. That is a large share of
+# per-epoch wall time. Validating every 5th epoch with raw-only during the
+# screen keeps a periodic best-checkpoint signal while cutting validation cost
+# ~10x; the final epoch is always validated (the trainer forces it) so a
+# terminal candidate is still produced. Skipped epochs record train metrics and
+# last.ckpt but NEVER update best (they are marked validated=false).
+#
+# IMPORTANT: this is a SPEED screen, not a quality conclusion. Any candidate
+# promoted from a screen with reduced validation MUST be re-confirmed with a
+# full raw+ema JPG validation on the final checkpoint before it can be called
+# an improvement. All training is executed on AutoDL only.
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+  seed: 2026
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: false
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 0
+loss:
+  schedule: constant
+  mse: 0.0
+  charbonnier: 0.40
+  ssim: 0.35
+  ms_ssim: 0.10
+  gradient: 0.10
+  frequency: 0.05
+  correlation: 0.02
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+train:
+  device: cuda
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw]
+  save_top_k: 1
+  async_metric_logging: false
+  batch_metric_log_interval: 0
+  validate_every_n_epochs: 5
+  float32_matmul_precision: highest
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  compile:
+    enabled: false
+    mode: default
+    backend: inductor
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+submission:
+  official: true
+  allow_smoke_manifest: false
+budget:
+  active: full

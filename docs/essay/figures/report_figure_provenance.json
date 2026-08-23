@@ -1,0 +1,53 @@
+{
+  "data_root": "dataset/official/train",
+  "display": "raw uint8 grayscale; overlays map DAPI to blue and CD68 to red without per-image normalization",
+  "figures": [
+    {
+      "path": "docs/essay/figures/marker_channels_roi007_09_11.png",
+      "stem": "ROI007_09_11",
+      "markers": [
+        "DAPI",
+        "HLA-DR",
+        "CD45RO",
+        "Vimentin",
+        "CD68"
+      ]
+    },
+    {
+      "path": "docs/essay/figures/cd68_activity_quantiles.png",
+      "selection_rule": "CD68 mean-intensity quantiles over 6296 pairs",
+      "samples": [
+        {
+          "level": "low (P10)",
+          "stem": "ROI011_13_08",
+          "cd68_mean": 0.09426155838311888,
+          "fraction_gt_0.25": 0.0167694091796875
+        },
+        {
+          "level": "median (P50)",
+          "stem": "ROI000_01_13",
+          "cd68_mean": 0.14769143497242648,
+          "fraction_gt_0.25": 0.0354461669921875
+        },
+        {
+          "level": "high (P90)",
+          "stem": "ROI014_13_09",
+          "cd68_mean": 0.21258987725949754,
+          "fraction_gt_0.25": 0.3057861328125
+        }
+      ]
+    },
+    {
+      "path": "docs/essay/figures/dapi_cd68_cell_zoom.png",
+      "stem": "ROI007_09_11",
+      "crop_row": 29,
+      "crop_col": 59,
+      "crop_size": 96
+    },
+    {
+      "path": "docs/essay/figures/real_patch_code_pipeline.png",
+      "stem": "ROI007_09_11",
+      "note": "CD68 tile is the training target, not a model prediction"
+    }
+  ]
+}

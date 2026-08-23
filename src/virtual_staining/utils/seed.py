@@ -9,8 +9,17 @@ import numpy as np
 import torch
 
 
-def set_seed(seed: int, *, deterministic: bool = True) -> torch.Generator:
-    """Seed Python, NumPy, and PyTorch and return a DataLoader generator."""
+def set_seed(seed: int, *, deterministic: bool = True, benchmark: bool | None = None) -> torch.Generator:
+    """Seed Python, NumPy, and PyTorch and return a DataLoader generator.
+
+    When ``benchmark`` is None (default), cuDNN benchmark is set to the inverse
+    of ``deterministic`` (legacy behaviour): deterministic mode disables the
+    auto-tuner, non-deterministic mode enables it. Pass an explicit bool to
+    override, e.g. ``benchmark=True`` to enable the auto-tuner while keeping
+    deterministic algorithms on (the auto-tuner's choice may itself be
+    non-deterministic, so this is only safe when input sizes are fixed, as they
+    are for this project's fixed 256x256 patches on the RTX 5090).
+    """
 
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
@@ -18,7 +27,9 @@ def set_seed(seed: int, *, deterministic: bool = True) -> torch.Generator:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = not deterministic
+    if benchmark is None:
+        benchmark = not deterministic
+    torch.backends.cudnn.benchmark = bool(benchmark)
     torch.backends.cudnn.deterministic = deterministic
     try:
         torch.use_deterministic_algorithms(deterministic, warn_only=True)

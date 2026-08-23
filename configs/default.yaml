@@ -19,9 +19,9 @@ data:
   image_size: 256
   input_mode: auto
   target_modes: auto
-  num_workers: 0
+  num_workers: 8
   pin_memory: true
-  persistent_workers: false
+  persistent_workers: true
   max_train_samples: null
   max_val_samples: null
   grouped_inner_folds:
@@ -106,8 +106,53 @@ train:
   early_stopping_patience: 30
   save_top_k: 3
   resume: null
-  deterministic: true
+  # RTX 5090 (Blackwell, 32GB, fixed 256x256 patches): cuDNN auto-tuner is safe
+  # and free, so disable deterministic algorithms and enable the auto-tuner.
+  deterministic: false
+  cudnn_benchmark: true
   max_oom_retries: 3
+  # auto: show batch progress only in an interactive terminal (for example AutoDL SSH).
+  # It stays off for nohup/redirection so train.log remains easy to read with tail.
+  progress_bar: auto
+  progress_bar_refresh_seconds: 1.0
+  # Async metric logging keeps loss/components as on-device 0-dim tensors during
+  # the hot path and synchronizes once per epoch (or every batch_metric_log_interval
+  # batches). Default false preserves the legacy per-batch CUDA->CPU sync behaviour
+  # so existing A/B comparisons and checkpoint provenance stay bit-identical.
+  async_metric_logging: false
+  # 0 = synchronize accumulated metrics only at epoch end. >0 = additionally sync
+  # every N batches for live logging (useful with an interactive progress bar).
+  batch_metric_log_interval: 0
+  # Validate every N epochs. Default 1 preserves legacy behaviour. Screen runs may
+  # set 5 to skip validation on intermediate epochs; skipped epochs never update
+  # best checkpoints and are recorded as unvalidated.
+  validate_every_n_epochs: 1
+  # torch.set_float32_matmul_precision. Default "highest" preserves legacy
+  # numerics; "high"/"medium" are A/B candidates on Ampere+ GPUs.
+  # torch.set_float32_matmul_precision. RTX 5090 (Blackwell) uses TF32 inner
+  # products with "high", a free throughput win with negligible numeric impact.
+  float32_matmul_precision: high
+  # channels_last memory format for convolution-dense models on Tensor Core
+  # GPUs (Ampere+/Blackwell). The model and input tensors are converted to NHWC
+  # so conv kernels hit the Tensor Core's 8-channel tile path. Safe for the
+  # NAF/Restormer-lite stack (verified: all reshape/layer_norm paths are
+  # channels_last-compatible).
+  channels_last: true
+  # Optional torch.profiler trace over the first N training batches. Disabled by
+  # default so production training never pays profiling overhead.
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  # Optional torch.compile of the model forward. Disabled by default; first
+  # epochs pay compile cost, so always A/B over >=5 epochs and fall back to eager
+  # on failure. mode maps to torch.compile mode.
+  compile:
+    enabled: false
+    mode: default
+    backend: inductor
   prototype_monitor:
     enabled: false
     dead_threshold: 0.0001

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -31,6 +33,8 @@ class DAPIPretrainer:
         learning_rate: float = 2e-4,
         weight_decay: float = 1e-4,
         amp: bool = True,
+        progress_bar: bool | str = "auto",
+        progress_bar_refresh_seconds: float = 1.0,
     ) -> None:
         requested = str(device)
         self.device = torch.device(
@@ -53,6 +57,39 @@ class DAPIPretrainer:
             else torch.float16
         )
         self.global_step = 0
+        self.progress_bar_enabled = self._resolve_progress_bar_enabled(progress_bar)
+        self.progress_bar_refresh_seconds = float(progress_bar_refresh_seconds)
+
+    @staticmethod
+    def _resolve_progress_bar_enabled(value: bool | str) -> bool:
+        """Mirror supervised training's interactive-terminal progress behavior."""
+
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().casefold()
+        if normalized == "auto":
+            isatty = getattr(sys.stderr, "isatty", None)
+            return bool(isatty()) if callable(isatty) else False
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError("progress_bar must be true, false, or auto")
+
+    def _create_progress_bar(self, *, epoch: int, total_epochs: int | None, total: int | None) -> Any:
+        if not self.progress_bar_enabled:
+            return None
+        from tqdm.auto import tqdm
+
+        epoch_label = f"{epoch + 1}/{total_epochs}" if total_epochs is not None else str(epoch + 1)
+        return tqdm(
+            total=total,
+            desc=f"DAPI pretrain {epoch_label}",
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=self.progress_bar_refresh_seconds,
+            leave=True,
+        )
 
     @staticmethod
     def _masked_l1(prediction: Tensor, reference: Tensor, mask: Tensor) -> Tensor:
@@ -60,38 +97,66 @@ class DAPIPretrainer:
         denominator = expanded.sum().clamp_min(1.0)
         return torch.sum(torch.abs(prediction - reference) * expanded) / denominator
 
-    def train_epoch(self, epoch: int) -> dict[str, float | int]:
+    def train_epoch(
+        self, epoch: int, *, total_epochs: int | None = None
+    ) -> dict[str, float | int]:
         self.model.train()
         started = time.perf_counter()
         losses: list[float] = []
-        for batch in self.dataloader:
-            inputs, _, metadata = unpack_batch(batch)
-            batch_size = int(inputs.shape[0])
-            for index in range(batch_size):
-                split = str(metadata_item(metadata, "split", index, "")).casefold()
-                if split not in self._ALLOWED_SPLITS:
-                    raise ValueError(
-                        f"DAPI pretraining accepts training splits only, received {split!r}"
+        batch_count = len(self.dataloader) if hasattr(self.dataloader, "__len__") else None
+        seen_samples = 0
+        progress = self._create_progress_bar(
+            epoch=epoch, total_epochs=total_epochs, total=batch_count
+        )
+        try:
+            for batch in self.dataloader:
+                inputs, _, metadata = unpack_batch(batch)
+                batch_size = int(inputs.shape[0])
+                for index in range(batch_size):
+                    split = str(metadata_item(metadata, "split", index, "")).casefold()
+                    if split not in self._ALLOWED_SPLITS:
+                        raise ValueError(
+                            f"DAPI pretraining accepts training splits only, received {split!r}"
+                        )
+                inputs = move_to_device(inputs, self.device)
+                self.optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    self.device.type,
+                    dtype=self.amp_dtype,
+                    enabled=self.amp and self.device.type in {"cpu", "cuda"},
+                ):
+                    output = self.model(inputs)
+                    reconstruction = output.reconstruction.float()
+                    reference = inputs.float()
+                    masked_l1 = self._masked_l1(
+                        reconstruction, reference, output.mask.float()
                     )
-            inputs = move_to_device(inputs, self.device)
-            self.optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(
-                self.device.type,
-                dtype=self.amp_dtype,
-                enabled=self.amp and self.device.type in {"cpu", "cuda"},
-            ):
-                output = self.model(inputs)
-                reconstruction = output.reconstruction.float()
-                reference = inputs.float()
-                masked_l1 = self._masked_l1(reconstruction, reference, output.mask.float())
-                ssim = self.ssim(reconstruction, reference)
-                loss = 0.8 * masked_l1 + 0.2 * ssim
-            if not torch.isfinite(loss):
-                raise FloatingPointError("DAPI pretraining loss became non-finite")
-            loss.backward()
-            self.optimizer.step()
-            self.global_step += 1
-            losses.append(float(loss.detach().cpu()))
+                    ssim = self.ssim(reconstruction, reference)
+                    loss = 0.8 * masked_l1 + 0.2 * ssim
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("DAPI pretraining loss became non-finite")
+                loss.backward()
+                self.optimizer.step()
+                self.global_step += 1
+                seen_samples += batch_size
+                loss_value = float(loss.detach().cpu())
+                losses.append(loss_value)
+                if progress is not None:
+                    elapsed = max(time.perf_counter() - started, 1e-12)
+                    postfix = {
+                        "loss": f"{loss_value:.4f}",
+                        "img/s": f"{seen_samples / elapsed:.2f}",
+                        "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                    }
+                    if self.device.type == "cuda":
+                        postfix["vram"] = (
+                            f"{torch.cuda.max_memory_allocated(self.device) / 1024**2:.0f}MiB"
+                        )
+                    progress.set_postfix(postfix, refresh=False)
+                    progress.update(1)
+        finally:
+            if progress is not None:
+                progress.close()
         if not losses:
             raise ValueError("DAPI pretraining dataloader produced no batches")
         return {
@@ -112,7 +177,22 @@ class DAPIPretrainer:
     ) -> list[dict[str, float | int]]:
         if epochs < 1:
             raise ValueError("Pretraining epochs must be positive")
-        history = [self.train_epoch(epoch) for epoch in range(epochs)]
+        logging.getLogger("virtual_staining").info(
+            "Starting DAPI pretraining: %d epoch(s), batch progress bar=%s",
+            epochs,
+            "enabled" if self.progress_bar_enabled else "disabled (non-interactive terminal or config)",
+        )
+        history: list[dict[str, float | int]] = []
+        for epoch in range(epochs):
+            metrics = self.train_epoch(epoch, total_epochs=epochs)
+            history.append(metrics)
+            logging.getLogger("virtual_staining").info(
+                "DAPI pretrain epoch %d/%d complete | loss=%.6f | %.3f seconds",
+                epoch + 1,
+                epochs,
+                float(metrics["loss"]),
+                float(metrics["duration_seconds"]),
+            )
         save_checkpoint(
             checkpoint_path,
             self.model,

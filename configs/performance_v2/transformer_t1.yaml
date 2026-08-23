@@ -1,0 +1,95 @@
+# T1 Transformer candidate (task book section 5.E.1): camp_vs_v2 + Restormer-lite.
+#
+# T0 = perf_a0_baseline (current multi_marker_restorer, global mixer off).
+# T1 = camp_vs_v2 with a TINY Restormer-lite global mixer:
+#   global_mixer.blocks_1_8:  1
+#   global_mixer.blocks_1_16: 1
+#   global_mixer.heads:       [2, 4]
+#   global_mixer.expansion:   2.0
+# context / cross-attention / mixture-of-experts are ALL disabled, isolating
+# the global mixer's effect on local restoration.
+#
+# The Restormer-lite block is CHANNEL attention (not spatial) operating on the
+# 1/8 (32x32=1024 token) and 1/16 (16x16=256 token) feature maps, so its cost is
+# O(C^2 * HW), GPU-friendly and memory-bounded. It must NOT be enabled before
+# the A1/A2/A3 data-and-sync bottlenecks are resolved: a Transformer cannot fix
+# a CPU data pipeline.
+#
+# This run uses the `train-v2` command (camp_vs_v2 requires it). Compared to T0
+# this is a STRUCTURAL screen, not a pure single-variable change: camp_vs_v2 has
+# a larger local encoder (widths [32,64,128,256] vs base_channels=32), a
+# base+detail output head and an intensity calibrator. The AUTODL doc must
+# record total parameter count, peak VRAM and per-epoch time alongside JPG
+# roi_ssim so any quality gain is weighed against compute cost. If T1 is much
+# slower than T0 without a stable JPG improvement, retain it as a research
+# config and roll back; do not promote to default. All training is executed on
+# AutoDL only.
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+  seed: 2026
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+model:
+  name: camp_vs_v2
+  use_sobel_input: true
+  local_encoder: {type: naf, widths: [32, 64, 128, 256], depths: [2, 2, 4, 4], drop_path: 0.0}
+  context: {enabled: false, grid_size: 3, missing_policy: center, include_center: true, token_dim: 128, encoder_width: 24, context_dropout: 0.1, fusion_scales: [4, 8, 16], bottleneck_cross_attention: false, residual_init: 0.0, stop_gradient: false, require_verified_grid: true, coordinate_source: filename, allow_numeric_stem_inference: false, allow_edge_graph_inference: false, tile_chunk_size: 9}
+  global_mixer: {enabled: true, type: restormer_lite, blocks_1_8: 1, blocks_1_16: 1, heads: [2, 4], expansion: 2.0}
+  conditioning: {marker_embedding: true, organ_embedding: false, film: true, zero_init: true, embedding_dim: 128}
+  adapters: {marker: true, organ: false, mixture_of_experts: false, reduction: 4}
+  prototypes: {enabled: false, scales: [8, 16], shared_count: 8, marker_count: 8, organ_count: 0, dim: 128, temperature: 0.1, residual_init: 0.0, reset_dead: false, dead_threshold: 0.0001}
+  output: {base_detail: true, max_detail_amplitude: 1.0, deep_supervision: true, deep_supervision_scales: [1, 2, 4, 8]}
+  intensity_calibrator: {enabled: true, max_gain_delta: 0.15, max_bias: 0.15}
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.7
+  phase_a: {mse: 0.10, charbonnier: 0.35, ssim: 0.30, ms_ssim: 0.10, pyramid: 0.10, gradient: 0.03, statistics: 0.02}
+  phase_b: {mse: 0.35, charbonnier: 0.15, ssim: 0.35, ms_ssim: 0.05, pyramid: 0.07, gradient: 0.02, statistics: 0.01}
+train:
+  device: cuda
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw, ema]
+  save_top_k: 1
+  async_metric_logging: false
+  batch_metric_log_interval: 0
+  validate_every_n_epochs: 1
+  float32_matmul_precision: highest
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  compile:
+    enabled: false
+    mode: default
+    backend: inductor
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+submission:
+  official: true
+  allow_smoke_manifest: false
+budget:
+  active: full

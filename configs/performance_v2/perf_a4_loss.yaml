@@ -1,0 +1,102 @@
+# A4 loss candidate (task book section 5.D): single-variable change vs A0.
+#
+# Delta vs perf_a0_baseline.yaml (loss weights only):
+#   charbonnier: 0.40 (kept)
+#   ssim:        0.35 (kept)
+#   ms_ssim:     0.10 -> 0.0
+#   gradient:    0.10 -> 0.0
+#   frequency:   0.05 -> 0.0
+#   correlation: 0.02 -> 0.0
+#   prototype_activation:  0.001 -> 0.0
+#   prototype_diversity:   0.001 -> 0.0
+#
+# Hypothesis: A0 carries many small float32 loss terms (ms_ssim, gradient,
+# frequency, correlation, prototype). Each adds forward/backward kernels and
+# some force extra CUDA->CPU syncs for diagnostics. This ablation keeps only
+# the two dominant terms (Charbonnier + SSIM) to measure both the throughput
+# effect of fewer kernels and whether the auxiliary terms actually help JPG
+# SSIM at all. ms_ssim/gradient/frequency weights are set to 0 (not removed) so
+# the loss module stays loaded and the run remains comparable.
+#
+# This is a QUALITY ablation, not just a speed test: if JPG SSIM does not drop
+# (or drops only marginally) the auxiliary terms may not be worth their cost; if
+# it drops clearly, keep them. Run a 3-5 epoch screen then confirm with a full
+# run. All training is executed on AutoDL only.
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+  seed: 2026
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: false
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 0
+loss:
+  schedule: constant
+  mse: 0.0
+  charbonnier: 0.40
+  ssim: 0.35
+  ms_ssim: 0.0
+  gradient: 0.0
+  frequency: 0.0
+  correlation: 0.0
+  prototype_activation: 0.0
+  prototype_diversity: 0.0
+train:
+  device: cuda
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw, ema]
+  save_top_k: 1
+  async_metric_logging: false
+  batch_metric_log_interval: 0
+  validate_every_n_epochs: 1
+  float32_matmul_precision: highest
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  compile:
+    enabled: false
+    mode: default
+    backend: inductor
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+submission:
+  official: true
+  allow_smoke_manifest: false
+budget:
+  active: full

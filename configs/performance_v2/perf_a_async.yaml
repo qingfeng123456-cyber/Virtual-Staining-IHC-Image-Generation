@@ -1,0 +1,101 @@
+# Async metric logging candidate (task book section 5.B): single-variable change
+# vs A0.
+#
+# Delta vs perf_a0_baseline.yaml:
+#   train.async_metric_logging: false -> true
+#
+# Hypothesis: A0 converts every microbatch loss and every loss component to a
+# Python float via float(tensor.detach().cpu()), forcing a CUDA->CPU sync per
+# microbatch per component (~3-5 syncs per microbatch, ~24 per optimizer step
+# with batch=2/accum=4). async_metric_logging keeps loss and components as
+# detached 0-dim tensors on-device during the hot path and synchronizes once per
+# epoch (batch_metric_log_interval=0) via _AsyncMetricBuffer. The finiteness
+# guard is intentionally kept as the one per-microbatch sync for NaN safety.
+#
+# This changes ONLY the timing of metric aggregation, not the optimization: the
+# epoch-mean loss printed by async mode equals the legacy mean up to float
+# summation order, gradients and checkpoints are unchanged. So this is a pure
+# speed candidate that must not move JPG SSIM; if it does, treat as a bug.
+#
+# Run a 3-5 epoch screen on AutoDL with profiler enabled
+# (train.profiler.enabled=true) to confirm the per-step sync count drops and GPU
+# utilization rises; compare images_per_second against A0. All training is
+# executed on AutoDL only.
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+  seed: 2026
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: false
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 0
+loss:
+  schedule: constant
+  mse: 0.0
+  charbonnier: 0.40
+  ssim: 0.35
+  ms_ssim: 0.10
+  gradient: 0.10
+  frequency: 0.05
+  correlation: 0.02
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+train:
+  device: cuda
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw, ema]
+  save_top_k: 1
+  async_metric_logging: true
+  batch_metric_log_interval: 0
+  validate_every_n_epochs: 1
+  float32_matmul_precision: highest
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  compile:
+    enabled: false
+    mode: default
+    backend: inductor
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+submission:
+  official: true
+  allow_smoke_manifest: false
+budget:
+  active: full

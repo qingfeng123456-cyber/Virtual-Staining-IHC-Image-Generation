@@ -1,5 +1,11 @@
-# Conservative initial-round configuration for the official ROI dataset.
-# Change both data.targets and data.submit_targets if the required marker changes.
+# Initial-round configuration for the official ROI dataset, tuned for the
+# AutoDL RTX 5090 (Blackwell, 32GB GDDR7). Change both data.targets and
+# data.submit_targets if the required marker changes.
+#
+# This config keeps the multi_marker_restorer (no Transformer) but raises
+# base_channels to 64 and batch to 8 (accumulation 2, effective batch 16) to
+# fill the 5090. The 5090 GPU-util flags (channels_last, cudnn_benchmark,
+# TF32, num_workers=8) are inherited from configs/default.yaml.
 project:
   output_root: outputs/initial_round
   artifact_root: artifacts
@@ -11,11 +17,11 @@ data:
   targets: [CD68]
   submit_targets: [CD68]
   val_ratio: 0.2
-  num_workers: 0
+  num_workers: 8
 
 model:
   name: multi_marker_restorer
-  base_channels: 32
+  base_channels: 64
   use_sobel_input: true
   use_task_adapters: true
   use_prototypes: true
@@ -42,8 +48,8 @@ loss:
 
 train:
   epochs: 120
-  batch_size: 2
-  gradient_accumulation: 4
+  batch_size: 8
+  gradient_accumulation: 2
   amp: true
   ema: true
   evaluate_weight_sources: [raw, ema]

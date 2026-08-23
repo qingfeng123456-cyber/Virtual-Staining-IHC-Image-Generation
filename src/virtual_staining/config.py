@@ -51,7 +51,11 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "early_stopping_patience", "save_top_k", "resume", "deterministic",
         "max_oom_retries", "task_name", "stages", "stage", "freeze_encoder_epochs",
         "stage_lr_scale", "metric_finetune_epochs", "evaluate_weight_sources",
-        "initial_weight_source", "prototype_monitor",
+        "initial_weight_source", "prototype_monitor", "progress_bar",
+        "progress_bar_refresh_seconds", "async_metric_logging",
+        "batch_metric_log_interval", "validate_every_n_epochs",
+        "float32_matmul_precision", "profiler", "compile",
+        "channels_last", "cudnn_benchmark",
     },
     "validation": {
         "device", "task_name", "primary_metric", "psnr_norm_min", "psnr_norm_max",
@@ -147,6 +151,12 @@ _NESTED_ALLOWED: dict[tuple[str, str], set[str]] = {
         "attention_visual_count",
         "attention_visual_seed",
         "attention_visual_size",
+    },
+    ("train", "profiler"): {
+        "enabled", "max_steps", "output_dir", "record_shapes", "with_stack",
+    },
+    ("train", "compile"): {
+        "enabled", "mode", "backend",
     },
     ("loss", "phase_a"): {
         "mse", "charbonnier", "ssim", "ms_ssim", "pyramid", "gradient", "statistics",
@@ -309,6 +319,20 @@ def validate_config(config: dict[str, Any]) -> None:
         value = config[section].get(key)
         if value != "auto" and int(value) < 1:
             raise ConfigError(f"{section}.{key} must be positive or 'auto'")
+    progress_bar = config["train"].get("progress_bar", "auto")
+    if not isinstance(progress_bar, bool) and str(progress_bar).casefold() != "auto":
+        raise ConfigError("train.progress_bar must be boolean or 'auto'")
+    progress_refresh_value = config["train"].get("progress_bar_refresh_seconds", 1.0)
+    if isinstance(progress_refresh_value, bool):
+        raise ConfigError("train.progress_bar_refresh_seconds must be finite and positive")
+    try:
+        progress_refresh_seconds = float(progress_refresh_value)
+    except (TypeError, ValueError) as error:
+        raise ConfigError(
+            "train.progress_bar_refresh_seconds must be finite and positive"
+        ) from error
+    if not math.isfinite(progress_refresh_seconds) or progress_refresh_seconds <= 0.0:
+        raise ConfigError("train.progress_bar_refresh_seconds must be finite and positive")
     for section, key in (("train", "batch_size"), ("inference", "batch_size")):
         value = config[section].get(key)
         if value != "auto" and int(value) < 1:
@@ -328,9 +352,59 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ConfigError(
                 "train.evaluate_weight_sources requests ema while train.ema is disabled"
             )
+    async_logging = config["train"].get("async_metric_logging", False)
+    if not isinstance(async_logging, bool):
+        raise ConfigError("train.async_metric_logging must be boolean")
+    log_interval = config["train"].get("batch_metric_log_interval", 0)
+    if (
+        isinstance(log_interval, bool)
+        or not isinstance(log_interval, int)
+        or log_interval < 0
+    ):
+        raise ConfigError("train.batch_metric_log_interval must be a nonnegative integer")
+    validate_every = config["train"].get("validate_every_n_epochs", 1)
+    if (
+        isinstance(validate_every, bool)
+        or not isinstance(validate_every, int)
+        or validate_every < 1
+    ):
+        raise ConfigError("train.validate_every_n_epochs must be a positive integer")
+    matmul_precision = str(
+        config["train"].get("float32_matmul_precision", "highest")
+    ).strip().casefold()
+    if matmul_precision not in {"highest", "high", "medium"}:
+        raise ConfigError(
+            "train.float32_matmul_precision must be one of highest, high, medium"
+        )
+    profiler_cfg = config["train"].get("profiler", {})
+    if profiler_cfg:
+        if not isinstance(profiler_cfg.get("enabled", False), bool):
+            raise ConfigError("train.profiler.enabled must be boolean")
+        profiler_steps = profiler_cfg.get("max_steps", 30)
+        if (
+            isinstance(profiler_steps, bool)
+            or not isinstance(profiler_steps, int)
+            or profiler_steps < 1
+        ):
+            raise ConfigError("train.profiler.max_steps must be a positive integer")
+    compile_cfg = config["train"].get("compile", {})
+    if compile_cfg:
+        if not isinstance(compile_cfg.get("enabled", False), bool):
+            raise ConfigError("train.compile.enabled must be boolean")
+        compile_mode = str(compile_cfg.get("mode", "default")).strip().casefold()
+        if compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
+            raise ConfigError(
+                "train.compile.mode must be default, reduce-overhead, or max-autotune"
+            )
     phase_a_ratio = float(config["loss"].get("phase_a_ratio", 0.7))
     if not 0.0 < phase_a_ratio < 1.0:
         raise ConfigError("loss.phase_a_ratio must be in (0, 1)")
+    channels_last_cfg = config["train"].get("channels_last", False)
+    if not isinstance(channels_last_cfg, bool):
+        raise ConfigError("train.channels_last must be boolean")
+    cudnn_benchmark_cfg = config["train"].get("cudnn_benchmark", None)
+    if cudnn_benchmark_cfg is not None and not isinstance(cudnn_benchmark_cfg, bool):
+        raise ConfigError("train.cudnn_benchmark must be boolean or null")
     context = config["model"].get("context", {})
     if context:
         grid_size = int(context.get("grid_size", 3))

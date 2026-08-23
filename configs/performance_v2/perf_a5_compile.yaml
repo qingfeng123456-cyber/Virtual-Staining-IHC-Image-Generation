@@ -1,0 +1,97 @@
+# A5 compile candidate (task book section 5.A): single-variable change vs A0.
+#
+# Delta vs perf_a0_baseline.yaml:
+#   train.compile.enabled: false -> true
+#   train.compile.mode:    default (inductor backend)
+#
+# Hypothesis: torch.compile fuses small kernels and reduces Python/launch
+# overhead, which may help when the GPU is launch-bound on tiny batches (as A0
+# is, with batch=2 and base_channels=32). The first 1-2 epochs pay compile cost
+# (potentially much slower), so throughput MUST be measured over >=5 epochs and
+# compared at steady state, not epoch 1. The trainer wraps the model in
+# torch.compile with a try/except that falls back to eager on failure, so a
+# compile problem cannot silently break training.
+#
+# Do NOT combine compile with a structural change (e.g. T1/T2 Transformer) in
+# the same run; keep it single-variable against A0. If compile does not improve
+# steady-state images_per_second or regresses JPG SSIM, retain it as an
+# optional flag and do not promote to default. All training is executed on
+# AutoDL only.
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+  seed: 2026
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: false
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 0
+loss:
+  schedule: constant
+  mse: 0.0
+  charbonnier: 0.40
+  ssim: 0.35
+  ms_ssim: 0.10
+  gradient: 0.10
+  frequency: 0.05
+  correlation: 0.02
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+train:
+  device: cuda
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw, ema]
+  save_top_k: 1
+  async_metric_logging: false
+  batch_metric_log_interval: 0
+  validate_every_n_epochs: 1
+  float32_matmul_precision: highest
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  compile:
+    enabled: true
+    mode: default
+    backend: inductor
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+submission:
+  official: true
+  allow_smoke_manifest: false
+budget:
+  active: full

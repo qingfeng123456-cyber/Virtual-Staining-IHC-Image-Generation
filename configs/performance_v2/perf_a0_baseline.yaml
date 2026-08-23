@@ -1,0 +1,97 @@
+# A0 baseline for the single-variable performance screen (task book section 6.2).
+#
+# This is the LEGACY configuration against which every candidate (A1-A5, T1-T2)
+# is compared. It must stay bit-identical to configs/initial_round_cd68.yaml in
+# every respect that affects numerics: same CD68 target, same base_channels=32
+# multi_marker_restorer, same loss weights, same batch=2 / accum=4 (effective 8),
+# same AMP+EMA, same JPG primary domain, same raw+ema validation every epoch.
+#
+# The only additions over initial_round_cd68.yaml are the new opt-in performance
+# flags, all set to their legacy/default-off values so this run reproduces the
+# historical behaviour exactly:
+#   - async_metric_logging: false   (per-microbatch CUDA->CPU sync, as before)
+#   - batch_metric_log_interval: 0   (no live interval sync)
+#   - validate_every_n_epochs: 1     (validate every epoch, as before)
+#   - float32_matmul_precision: highest (no TF32, as before)
+#   - profiler.enabled: false        (no tracing overhead)
+#   - compile.enabled: false         (eager model, as before)
+#
+# All real training/profiling for this config is executed on AutoDL only.
+project:
+  output_root: outputs/performance_v2
+  artifact_root: artifacts/performance_v2
+  seed: 2026
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+model:
+  name: multi_marker_restorer
+  base_channels: 32
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  base_detail: false
+  context:
+    enabled: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 0
+loss:
+  schedule: constant
+  mse: 0.0
+  charbonnier: 0.40
+  ssim: 0.35
+  ms_ssim: 0.10
+  gradient: 0.10
+  frequency: 0.05
+  correlation: 0.02
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+train:
+  device: cuda
+  epochs: 120
+  batch_size: 2
+  gradient_accumulation: 4
+  amp: true
+  ema: true
+  evaluate_weight_sources: [raw, ema]
+  save_top_k: 1
+  async_metric_logging: false
+  batch_metric_log_interval: 0
+  validate_every_n_epochs: 1
+  float32_matmul_precision: highest
+  profiler:
+    enabled: false
+    max_steps: 30
+    output_dir: null
+    record_shapes: false
+    with_stack: false
+  compile:
+    enabled: false
+    mode: default
+    backend: inductor
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: none
+submission:
+  official: true
+  allow_smoke_manifest: false
+budget:
+  active: full

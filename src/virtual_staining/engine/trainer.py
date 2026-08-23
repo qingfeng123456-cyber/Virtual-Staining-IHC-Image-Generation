@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import random
+import sys
 import time
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 import torch
 from torch import Tensor, nn
 
@@ -171,6 +174,84 @@ def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> tuple[nn.Paramete
     return tuple(parameters)
 
 
+class _AsyncMetricBuffer:
+    """Accumulate 0-dim on-device loss tensors without per-batch CPU sync.
+
+    The legacy training hot path converts every microbatch loss and every loss
+    component to a Python float via ``float(tensor.detach().cpu())``. Each such
+    conversion forces the CPU to wait for all prior CUDA kernels to complete,
+    serializing CPU and GPU and starving the GPU on small batches. This buffer
+    keeps the detached 0-dim tensors on their original device and performs a
+    single synchronized reduction when :meth:`sync` is called (typically once per
+    epoch, or every ``batch_metric_log_interval`` batches when live logging is
+    requested). Numerically, the epoch-mean loss and component means match the
+    legacy float-path means up to floating-point summation order.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._loss_tensors: list[Tensor] = []
+        self._component_tensors: dict[str, list[Tensor]] = defaultdict(list)
+
+    def __bool__(self) -> bool:
+        return bool(self._loss_tensors)
+
+    def __len__(self) -> int:
+        return len(self._loss_tensors)
+
+    def append(
+        self, loss: Tensor, components: Mapping[str, Tensor]
+    ) -> None:
+        """Record one microbatch's detached 0-dim loss and component tensors."""
+        detached_loss = loss.detach()
+        if detached_loss.device != self._device:
+            detached_loss = detached_loss.to(self._device)
+        self._loss_tensors.append(detached_loss)
+        for key, value in components.items():
+            if not isinstance(value, Tensor) or value.numel() != 1:
+                continue
+            detached = value.detach()
+            if detached.device != self._device:
+                detached = detached.to(self._device)
+            self._component_tensors[str(key)].append(detached)
+
+    def running_mean_loss(self) -> float | None:
+        """Synchronize the running mean loss for progress-bar display.
+
+        This intentionally performs a CPU sync and should only be called when a
+        live progress bar is active (i.e. an interactive terminal). It returns
+        ``None`` when no batches have been recorded yet.
+        """
+        if not self._loss_tensors:
+            return None
+        stacked = torch.stack(self._loss_tensors)
+        return float(stacked.mean().cpu().item())
+
+    def sync(self) -> tuple[float, dict[str, float]]:
+        """Reduce all accumulated tensors to Python floats in one sync point.
+
+        Returns ``(mean_loss, component_means)``. The buffer is cleared after
+        syncing so it can be reused for the next epoch.
+        """
+        if not self._loss_tensors:
+            return float("nan"), {}
+        loss_mean_tensor = torch.stack(self._loss_tensors).mean()
+        component_mean_tensors = {
+            key: torch.stack(values).mean()
+            for key, values in self._component_tensors.items()
+            if values
+        }
+        # Single synchronization point: pull all scalars to CPU together.
+        loss_float = float(loss_mean_tensor.cpu().item())
+        component_floats = {
+            key: float(value.cpu().item())
+            for key, value in component_mean_tensors.items()
+        }
+        self._loss_tensors.clear()
+        self._component_tensors.clear()
+        return loss_float, component_floats
+
+
 class Trainer:
     """Train an arbitrary restoration model against a compatible loss callable."""
 
@@ -192,6 +273,63 @@ class Trainer:
         configured_device = config_get(config, "train.device", config_get(config, "device", "auto"))
         self.device = _resolve_device(device if device is not None else configured_device)
         self.model = model.to(self.device)
+        # float32 matmul precision: "highest" is the PyTorch default and leaves
+        # numerics untouched (legacy). "high"/"medium" enable TF32 inner products
+        # on Ampere+ and are A/B candidates for throughput; they may slightly
+        # change reduction order, so they stay opt-in and never affect the
+        # default configuration.
+        matmul_precision = str(
+            config_get(config, "train.float32_matmul_precision", "highest")
+        ).strip().casefold()
+        if matmul_precision != "highest":
+            torch.set_float32_matmul_precision(matmul_precision)
+        self.float32_matmul_precision = matmul_precision
+        # Optional torch.compile of the model forward. Disabled by default; the
+        # first epochs pay compile cost so always A/B over >=5 epochs. On any
+        # failure (unsupported op, signature issues, missing inductor) we fall
+        # back to eager so a compile problem can never silently break training.
+        compile_options = config_get(config, "train.compile", {}) or {}
+        self.compile_enabled = bool(compile_options.get("enabled", False)) if isinstance(
+            compile_options, Mapping
+        ) else False
+        self._compiled_model: nn.Module | None = None
+        if self.compile_enabled:
+            compile_mode = str(compile_options.get("mode", "default"))
+            compile_backend = compile_options.get("backend", "inductor")
+            try:
+                self.model = torch.compile(
+                    self.model, mode=compile_mode, backend=compile_backend
+                )
+                self._compiled_model = self.model
+                logging.getLogger("virtual_staining").info(
+                    "torch.compile enabled (mode=%s, backend=%s); first epochs pay "
+                    "compile cost, evaluate throughput over >=5 epochs",
+                    compile_mode,
+                    compile_backend,
+                )
+            except Exception as error:  # pragma: no cover - depends on backend
+                logging.getLogger("virtual_staining").warning(
+                    "torch.compile failed (%s); falling back to eager model", error
+                )
+                self.compile_enabled = False
+                self._compiled_model = None
+        # channels_last memory format: opt-in flag for convolution-dense models
+        # on Tensor Core GPUs (Ampere+ / Blackwell). It reorders physical memory
+        # to NHWC so conv kernels hit the Tensor Core's 8-channel tile path,
+        # yielding a notable throughput win with AMP. Default false preserves the
+        # legacy NCHW layout. Applied to the model here; input tensors are
+        # converted per-batch in _backward_microbatch via _to_channels_last.
+        self.channels_last_enabled = bool(
+            config_get(config, "train.channels_last", False)
+        ) and self.device.type == "cuda"
+        if self.channels_last_enabled:
+            try:
+                self.model = self.model.to(memory_format=torch.channels_last)
+            except Exception as error:  # pragma: no cover - model-dependent
+                logging.getLogger("virtual_staining").warning(
+                    "channels_last not applicable to model (%s); using NCHW", error
+                )
+                self.channels_last_enabled = False
         self.dataloader = dataloader
         self.loss_fn = loss_fn.to(self.device) if isinstance(loss_fn, nn.Module) else loss_fn
         learning_rate = float(config_get(config, "train.lr", 2e-4))
@@ -302,6 +440,79 @@ class Trainer:
             interval=gradient_interval,
         )
         self._last_gradient_monitor_step: int | None = None
+        self._epoch_callbacks: list[Callable[[Mapping[str, Any]], None]] = []
+        self.progress_bar_enabled = self._resolve_progress_bar_enabled(
+            config_get(config, "train.progress_bar", "auto")
+        )
+        self.progress_bar_refresh_seconds = float(
+            config_get(config, "train.progress_bar_refresh_seconds", 1.0)
+        )
+        # Async metric logging: when True, the hot path keeps loss/components as
+        # on-device 0-dim tensors and synchronizes once per epoch (or every
+        # batch_metric_log_interval batches for live logging). Default False
+        # preserves the legacy per-microbatch CUDA->CPU sync behaviour.
+        self.async_metric_logging = bool(
+            config_get(config, "train.async_metric_logging", False)
+        )
+        self.batch_metric_log_interval = int(
+            config_get(config, "train.batch_metric_log_interval", 0)
+        )
+        # Profiler trace directory is populated lazily by _maybe_start_profiler;
+        # initialize it so attribute access is always safe.
+        self._profiler_trace_dir: Path | None = None
+
+    @staticmethod
+    def _resolve_progress_bar_enabled(value: Any) -> bool:
+        """Resolve the terminal progress-bar setting without polluting log files."""
+
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().casefold()
+        if normalized == "auto":
+            isatty = getattr(sys.stderr, "isatty", None)
+            return bool(isatty()) if callable(isatty) else False
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError("train.progress_bar must be true, false, or auto")
+
+    def _create_progress_bar(self, *, epoch: int, total_epochs: int | None, total: int | None) -> Any:
+        """Create a live batch bar only for an interactive terminal session."""
+
+        if not self.progress_bar_enabled:
+            return None
+        from tqdm.auto import tqdm
+
+        epoch_label = f"{epoch + 1}/{total_epochs}" if total_epochs is not None else str(epoch + 1)
+        return tqdm(
+            total=total,
+            desc=f"Train {epoch_label}",
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=self.progress_bar_refresh_seconds,
+            leave=True,
+        )
+
+    def add_epoch_callback(self, callback: Callable[[Mapping[str, Any]], None]) -> None:
+        """Register a best-effort callback invoked after every completed epoch."""
+
+        if not callable(callback):
+            raise TypeError("epoch callback must be callable")
+        self._epoch_callbacks.append(callback)
+
+    def _notify_epoch_callbacks(self, entry: Mapping[str, Any]) -> None:
+        """Write diagnostics without allowing a log I/O failure to stop training."""
+
+        for callback in self._epoch_callbacks:
+            try:
+                callback(entry)
+            except Exception:
+                import logging
+
+                logging.getLogger("virtual_staining").exception(
+                    "Epoch diagnostic callback failed; training will continue"
+                )
 
     def sync_ema_from_model(self, *, reset_num_updates: bool = True) -> bool:
         """Synchronize EMA after an initial-weight load and report whether it exists."""
@@ -508,9 +719,24 @@ class Trainer:
             enabled=enabled,
         )
 
+    def _to_channels_last(self, value: Any) -> Any:
+        """Convert 4D float tensors to channels_last when the flag is on.
+
+        Channels-last must be applied to BOTH the model parameters and the
+        input/feature tensors for the conv kernels to take the optimized NHWC
+        path. Non-4D tensors and non-floating tensors are left untouched. The
+        conversion is a metadata-only stride change (no copy) when the tensor is
+        already contiguous in NCHW, so the overhead is negligible.
+        """
+        if not self.channels_last_enabled:
+            return value
+        if isinstance(value, Tensor) and value.ndim == 4 and torch.is_floating_point(value):
+            return value.to(memory_format=torch.channels_last)
+        return value
+
     def _compute_loss(
-        self, output: Any, targets: dict[str, Tensor]
-    ) -> tuple[Tensor, dict[str, float], Mapping[str, Tensor]]:
+        self, output: Any, targets: dict[str, Tensor], *, keep_on_device: bool = False
+    ) -> tuple[Tensor, dict[str, Any], Mapping[str, Tensor]]:
         if isinstance(self.loss_fn, nn.modules.loss._Loss):
             pairs = resolve_target_pairs(extract_predictions(output), targets)
             if len(pairs) != 1:
@@ -521,7 +747,7 @@ class Trainer:
             result = self.loss_fn(output, next(iter(targets.values())))
         else:
             result = self.loss_fn(output, targets)
-        total, components = loss_total(result)
+        total, components = loss_total(result, keep_on_device=keep_on_device)
         raw_per_task = getattr(result, "per_task", {})
         per_task = (
             {
@@ -559,10 +785,11 @@ class Trainer:
         )
 
     def _backward_microbatch(
-        self, batch: Any, *, loss_divisor: float
-    ) -> tuple[float, dict[str, float]]:
+        self, batch: Any, *, loss_divisor: float, keep_on_device: bool = False
+    ) -> tuple[Any, dict[str, Any]]:
         inputs, targets, metadata = unpack_batch(batch)
         inputs = move_to_device(inputs, self.device)
+        inputs = self._to_channels_last(inputs)
         targets = move_to_device(targets, self.device)
         metadata = move_to_device(metadata, self.device)
         if not targets:
@@ -577,7 +804,9 @@ class Trainer:
                 effective_task,
                 model_kwargs=model_kwargs_from_metadata(metadata),
             )
-            total, components, per_task = self._compute_loss(output, targets)
+            total, components, per_task = self._compute_loss(
+                output, targets, keep_on_device=keep_on_device
+            )
             if (
                 len(per_task) > 1
                 and self._last_gradient_monitor_step != self.global_step
@@ -593,6 +822,12 @@ class Trainer:
                     for key, value in gradient_report.summary.items():
                         if isinstance(value, (int, float)):
                             components[f"gradient_cosine/{key}"] = float(value)
+        # Finiteness guard: this is the one intentional sync on the hot path. It
+        # protects the optimizer from NaN/Inf losses propagating into gradients.
+        # We keep it even in async mode so a single bad microbatch is caught
+        # before backward corrupts model state; the cost is one sync per
+        # microbatch, which is far smaller than the per-component syncs removed
+        # by keep_on_device.
         if total.numel() != 1 or not torch.isfinite(total.detach()).all():
             raise FloatingPointError(f"Training loss must be one finite scalar, got {total}")
         scaled_loss = total / float(loss_divisor)
@@ -602,9 +837,15 @@ class Trainer:
             scaled_loss.backward()
         if self.prototype_monitor is not None:
             self.prototype_monitor.observe(output)
+        if keep_on_device:
+            # Return detached 0-dim on-device tensors; the caller accumulates
+            # them and synchronizes once per epoch (or every N batches).
+            return total.detach(), components
         return float(total.detach().cpu()), components
 
-    def _run_batch_with_oom_recovery(self, batch: Any) -> tuple[float, dict[str, float]]:
+    def _run_batch_with_oom_recovery(
+        self, batch: Any, *, keep_on_device: bool = False
+    ) -> tuple[Any, dict[str, Any]]:
         batch_size = infer_batch_size(batch)
         while True:
             chunk_size = max(1, math.ceil(batch_size / self.microbatch_factor))
@@ -612,12 +853,31 @@ class Trainer:
                 slice_batch(batch, start, min(start + chunk_size, batch_size), batch_size)
                 for start in range(0, batch_size, chunk_size)
             ]
-            losses: list[float] = []
-            component_sums: dict[str, float] = defaultdict(float)
             try:
                 divisor = float(self.gradient_accumulation * len(chunks))
+                if keep_on_device:
+                    loss_tensors: list[Tensor] = []
+                    component_lists: dict[str, list[Tensor]] = defaultdict(list)
+                    for chunk in chunks:
+                        value, components = self._backward_microbatch(
+                            chunk, loss_divisor=divisor, keep_on_device=True
+                        )
+                        loss_tensors.append(value)
+                        for key, component in components.items():
+                            component_lists[str(key)].append(component)
+                    loss_mean = torch.stack(loss_tensors).mean()
+                    component_means: dict[str, Any] = {
+                        key: torch.stack(values).mean()
+                        for key, values in component_lists.items()
+                        if values
+                    }
+                    return loss_mean, component_means
+                losses: list[float] = []
+                component_sums: dict[str, float] = defaultdict(float)
                 for chunk in chunks:
-                    value, components = self._backward_microbatch(chunk, loss_divisor=divisor)
+                    value, components = self._backward_microbatch(
+                        chunk, loss_divisor=divisor
+                    )
                     losses.append(value)
                     for key, component in components.items():
                         component_sums[key] += component
@@ -651,7 +911,75 @@ class Trainer:
             self.ema.update(self.model)
         self.global_step += 1
 
-    def train_epoch(self, epoch: int = 0) -> dict[str, float | int]:
+    def _maybe_start_profiler(self, epoch: int) -> Any:
+        """Start a torch.profiler trace over the first epoch's first N batches.
+
+        Returns an entered profiler object, or ``None`` when profiling is
+        disabled, already consumed, or unavailable. The profiler is only ever
+        started on the very first epoch (``global_step == 0``) so resumed or
+        later epochs never pay tracing cost.
+        """
+        profiler_cfg = config_get(self.config, "train.profiler", {}) or {}
+        if not isinstance(profiler_cfg, Mapping) or not bool(
+            profiler_cfg.get("enabled", False)
+        ):
+            return None
+        # Only profile the first epoch ever trained by this trainer instance.
+        if self.global_step != 0:
+            return None
+        max_steps = int(profiler_cfg.get("max_steps", 30))
+        if max_steps < 1:
+            return None
+        record_shapes = bool(profiler_cfg.get("record_shapes", False))
+        with_stack = bool(profiler_cfg.get("with_stack", False))
+        trace_dir_value = profiler_cfg.get("output_dir")
+        if trace_dir_value:
+            trace_dir = Path(str(trace_dir_value)).expanduser().resolve()
+        else:
+            trace_dir = Path(".") / "log" / "profiler"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        self._profiler_trace_dir = trace_dir
+        try:
+            profiler = torch.profiler.profile(
+                schedule=torch.profiler.schedule(
+                    wait=0, warmup=0, active=max_steps, repeat=1
+                ),
+                record_shapes=record_shapes,
+                with_stack=with_stack,
+            )
+            profiler.__enter__()
+            logging.getLogger("virtual_staining").info(
+                "torch.profiler started: tracing first %d batches of epoch %d to %s",
+                max_steps,
+                epoch + 1,
+                trace_dir,
+            )
+            return profiler
+        except Exception as error:  # pragma: no cover - depends on torch build
+            logging.getLogger("virtual_staining").warning(
+                "torch.profiler could not be started (%s); training continues "
+                "without profiling",
+                error,
+            )
+            return None
+
+    def _finalize_profiler(self, profiler: Any, epoch: int) -> None:
+        """Stop the profiler and export a Chrome trace; never raise into training."""
+        try:
+            profiler.__exit__(None, None, None)
+            trace_path = self._profiler_trace_dir / f"profiler_epoch{epoch + 1:04d}.json"
+            profiler.export_chrome_trace(str(trace_path))
+            logging.getLogger("virtual_staining").info(
+                "torch.profiler trace written to %s", trace_path
+            )
+        except Exception as error:  # pragma: no cover - depends on torch build
+            logging.getLogger("virtual_staining").warning(
+                "torch.profiler finalization failed (%s); training continues", error
+            )
+
+    def train_epoch(
+        self, epoch: int = 0, *, total_epochs: int | None = None
+    ) -> dict[str, float | int]:
         """Run one complete training epoch and return real measured statistics."""
         activity_plan = getattr(self, "activity_sampling_plan", None)
         set_sampler_epoch = getattr(activity_plan, "set_epoch", None)
@@ -666,19 +994,74 @@ class Trainer:
         started = time.perf_counter()
         losses: list[float] = []
         components: dict[str, list[float]] = defaultdict(list)
+        async_buffer: _AsyncMetricBuffer | None = (
+            _AsyncMetricBuffer(self.device) if self.async_metric_logging else None
+        )
         batch_count = len(self.dataloader) if hasattr(self.dataloader, "__len__") else None
         seen_batches = 0
         seen_samples = 0
-        for batch_index, batch in enumerate(self.dataloader):
-            seen_samples += infer_batch_size(batch)
-            loss_value, logged = self._run_batch_with_oom_recovery(batch)
-            losses.append(loss_value)
-            for key, value in logged.items():
-                components[key].append(float(value))
-            seen_batches += 1
-            is_last = batch_count is not None and batch_index + 1 == batch_count
-            if (batch_index + 1) % self.gradient_accumulation == 0 or is_last:
-                self._optimizer_step()
+        progress = self._create_progress_bar(
+            epoch=epoch, total_epochs=total_epochs, total=batch_count
+        )
+        # Optional torch.profiler over the first N batches of the first epoch
+        # only. Disabled by default so production training never pays profiling
+        # overhead; when enabled it records CPU/CUDA time, DataLoader waits and
+        # memory, then writes a Chrome trace for offline analysis on AutoDL.
+        profiler = self._maybe_start_profiler(epoch)
+        try:
+            for batch_index, batch in enumerate(self.dataloader):
+                batch_samples = infer_batch_size(batch)
+                seen_samples += batch_samples
+                if async_buffer is not None:
+                    loss_tensor, component_tensors = self._run_batch_with_oom_recovery(
+                        batch, keep_on_device=True
+                    )
+                    async_buffer.append(loss_tensor, component_tensors)
+                    loss_value: float | None = None
+                else:
+                    loss_value, logged = self._run_batch_with_oom_recovery(batch)
+                    losses.append(loss_value)
+                    for key, value in logged.items():
+                        components[key].append(float(value))
+                seen_batches += 1
+                is_last = batch_count is not None and batch_index + 1 == batch_count
+                if (batch_index + 1) % self.gradient_accumulation == 0 or is_last:
+                    self._optimizer_step()
+                if profiler is not None:
+                    profiler.step()
+                if progress is not None:
+                    elapsed = max(time.perf_counter() - started, 1e-12)
+                    postfix: dict[str, str] = {
+                        "img/s": f"{seen_samples / elapsed:.2f}",
+                        "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                    }
+                    if async_buffer is not None:
+                        # Only pay for a CUDA->CPU sync when the user explicitly
+                        # requested live interval logging; otherwise keep loss
+                        # on-device until epoch end.
+                        if (
+                            self.batch_metric_log_interval > 0
+                            and seen_batches % self.batch_metric_log_interval == 0
+                        ):
+                            running_loss = async_buffer.running_mean_loss()
+                            postfix["loss"] = (
+                                f"{running_loss:.4f}" if running_loss is not None else "n/a"
+                            )
+                        else:
+                            postfix["loss"] = "async"
+                    else:
+                        postfix["loss"] = f"{loss_value:.4f}"
+                    if self.device.type == "cuda":
+                        postfix["vram"] = (
+                            f"{torch.cuda.max_memory_allocated(self.device) / 1024**2:.0f}MiB"
+                        )
+                    progress.set_postfix(postfix, refresh=False)
+                    progress.update(1)
+        finally:
+            if progress is not None:
+                progress.close()
+            if profiler is not None:
+                self._finalize_profiler(profiler, epoch)
         if seen_batches == 0:
             raise ValueError("Training dataloader produced no batches")
         if batch_count is None and seen_batches % self.gradient_accumulation:
@@ -688,24 +1071,45 @@ class Trainer:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         duration_seconds = float(time.perf_counter() - started)
+        if async_buffer is not None:
+            mean_loss, component_means = async_buffer.sync()
+            epoch_loss = mean_loss
+        else:
+            epoch_loss = float(np.mean(losses))
+            component_means = {
+                key: float(np.mean(values)) for key, values in components.items()
+            }
         result: dict[str, float | int] = {
             "epoch": int(epoch),
-            "loss": float(np.mean(losses)),
+            "loss": epoch_loss,
             "duration_seconds": duration_seconds,
             "seen_samples": seen_samples,
+            "seen_batches": seen_batches,
             "images_per_second": float(seen_samples / duration_seconds),
             "peak_vram_bytes": (
                 int(torch.cuda.max_memory_allocated(self.device))
                 if self.device.type == "cuda"
                 else 0
             ),
+            "peak_vram_reserved_bytes": (
+                int(torch.cuda.max_memory_reserved(self.device))
+                if self.device.type == "cuda"
+                else 0
+            ),
+            "process_rss_bytes": int(psutil.Process().memory_info().rss),
+            "system_ram_available_bytes": int(psutil.virtual_memory().available),
+            "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
             "global_step": self.global_step,
             "oom_retries": self.oom_retries,
             "effective_microbatch_factor": self.microbatch_factor,
             "gradient_accumulation": self.gradient_accumulation,
+            "async_metric_logging": bool(self.async_metric_logging),
+            "float32_matmul_precision": self.float32_matmul_precision,
+            "torch_compile_enabled": bool(self.compile_enabled),
+            "channels_last_enabled": bool(self.channels_last_enabled),
         }
-        for key, values in components.items():
-            result[f"loss/{key}"] = float(np.mean(values))
+        for key, value in component_means.items():
+            result[f"loss/{key}"] = value
         if self.prototype_monitor is not None:
             prototype_summary = self.prototype_monitor.finalize_epoch(epoch)
             if prototype_summary["total_prototypes"]:
@@ -745,6 +1149,12 @@ class Trainer:
         total_epochs = int(epochs if epochs is not None else config_get(self.config, "train.epochs", 1))
         if total_epochs <= start_epoch:
             raise ValueError("epochs must be greater than start_epoch")
+        logging.getLogger("virtual_staining").info(
+            "Starting supervised training: epoch %d through %d, batch progress bar=%s",
+            start_epoch + 1,
+            total_epochs,
+            "enabled" if self.progress_bar_enabled else "disabled (non-interactive terminal or config)",
+        )
         output_dir = Path(checkpoint_dir).resolve() if checkpoint_dir is not None else None
         activity_plan = getattr(self, "activity_sampling_plan", None)
         if self.prototype_monitor is not None and output_dir is not None:
@@ -755,6 +1165,14 @@ class Trainer:
         epochs_without_improvement = 0
         patience = max(0, int(config_get(self.config, "train.early_stopping_patience", 0) or 0))
         save_top_k = max(0, int(config_get(self.config, "train.save_top_k", 3) or 0))
+        # Validate every N epochs. Default 1 preserves the legacy behaviour of
+        # validating every epoch. Screen runs may set a larger value to skip
+        # validation on intermediate epochs; skipped epochs never update best
+        # checkpoints (they are recorded as unvalidated) and the final epoch is
+        # always validated when a validator is provided.
+        validate_every = max(
+            1, int(config_get(self.config, "train.validate_every_n_epochs", 1) or 1)
+        )
         if output_dir is not None and start_epoch == 0:
             top_directory = output_dir / "top_k"
             if top_directory.is_dir():
@@ -766,6 +1184,11 @@ class Trainer:
         historical_best_ssim = -float("inf")
         for item in self.metric_history:
             macro = item.get("validation", {}).get("macro", {})
+            # Skip epochs that were not validated (e.g. validate_every_n_epochs
+            # skip-epochs) or that had no validator: they carry no SSIM signal
+            # and must not inflate the early-stopping streak.
+            if not macro:
+                continue
             values = {
                 "ssim": float(macro.get("mean_ssim", -float("inf"))),
                 "psnr": float(macro.get("mean_psnr", -float("inf"))),
@@ -796,19 +1219,31 @@ class Trainer:
             set_progress = getattr(self.loss_fn, "set_progress", None)
             if callable(set_progress):
                 set_progress(epoch=epoch, total_epochs=total_epochs)
-            train_metrics = self.train_epoch(epoch)
+            train_metrics = self.train_epoch(epoch, total_epochs=total_epochs)
             if self.stage_controller is not None:
                 self.stage_controller.advance_epoch()
             entry: dict[str, Any] = {"train": train_metrics}
-            if validator is not None:
+            # A validation epoch is one where we actually run the validator. The
+            # last epoch is always validated (when a validator exists) so a
+            # final candidate is always produced; intermediate epochs honour
+            # validate_every_n_epochs to trade validation cost for screen speed.
+            is_validation_epoch = validator is not None and (
+                (epoch + 1) % validate_every == 0 or epoch == total_epochs - 1
+            )
+            if validator is not None and is_validation_epoch:
                 if hasattr(validator, "prototype_diagnostics_epoch"):
                     validator.prototype_diagnostics_epoch = int(epoch)
+                validation_start = time.perf_counter()
                 validation, source_results, selected_source = (
                     self._evaluate_weight_sources(validator)
+                )
+                entry["validation_duration_seconds"] = float(
+                    time.perf_counter() - validation_start
                 )
                 entry["validation"] = validation
                 entry["validation_weight_sources"] = source_results
                 entry["selected_weight_source"] = selected_source
+                entry["validated"] = True
                 macro = validation.get("macro", {})
                 current = {
                     "ssim": float(macro.get("mean_ssim", -float("inf"))),
@@ -816,9 +1251,43 @@ class Trainer:
                     "proxy": float(macro.get("local_proxy_score", -float("inf"))),
                 }
             else:
+                # Either no validator at all, or a skip-epoch: do not touch best.
                 current = best.copy()
+                if validator is not None:
+                    entry["validated"] = False
+                    entry["validation_skipped"] = True
+                    entry["validation_every_n_epochs"] = validate_every
             self.metric_history.append(entry)
+            if validator is None:
+                logging.getLogger("virtual_staining").info(
+                    "Epoch %d/%d complete | loss=%.6f | %.3f img/s",
+                    epoch + 1,
+                    total_epochs,
+                    float(train_metrics["loss"]),
+                    float(train_metrics["images_per_second"]),
+                )
+            elif is_validation_epoch:
+                logging.getLogger("virtual_staining").info(
+                    "Epoch %d/%d complete | loss=%.6f | %.3f img/s | val_ssim=%.6f | val_psnr=%.4f",
+                    epoch + 1,
+                    total_epochs,
+                    float(train_metrics["loss"]),
+                    float(train_metrics["images_per_second"]),
+                    current["ssim"],
+                    current["psnr"],
+                )
+            else:
+                logging.getLogger("virtual_staining").info(
+                    "Epoch %d/%d complete | loss=%.6f | %.3f img/s | validation=skipped (every=%d)",
+                    epoch + 1,
+                    total_epochs,
+                    float(train_metrics["loss"]),
+                    float(train_metrics["images_per_second"]),
+                    validate_every,
+                )
+            self._notify_epoch_callbacks(entry)
             if output_dir is not None:
+                checkpoint_start = time.perf_counter()
                 output_dir.mkdir(parents=True, exist_ok=True)
                 save_kwargs = {
                     "ema": self.ema,
@@ -916,35 +1385,44 @@ class Trainer:
                     or None,
                 }
                 save_checkpoint(output_dir / "last.ckpt", self.model, **save_kwargs)
-                for metric, filename in (
-                    ("ssim", "best_ssim.ckpt"),
-                    ("psnr", "best_psnr.ckpt"),
-                    ("proxy", "best_proxy.ckpt"),
-                ):
-                    if current[metric] > best[metric]:
-                        best[metric] = current[metric]
-                        save_checkpoint(output_dir / filename, self.model, **save_kwargs)
-                if validator is not None and save_top_k:
-                    rank = (current["ssim"], current["psnr"])
-                    qualifies = (
-                        len(self._top_checkpoints) < save_top_k
-                        or rank > self._top_checkpoints[-1][0]
-                    )
-                    if qualifies:
-                        top_path = output_dir / "top_k" / (
-                            f"epoch_{epoch:04d}_ssim_{current['ssim']:.6f}.ckpt"
+                # Best checkpoints and top-k may only be updated on epochs that
+                # were actually validated. Skipped epochs must never overwrite a
+                # genuine best with an unvalidated sentinel, and must never pose
+                # as a top-k candidate.
+                if is_validation_epoch:
+                    for metric, filename in (
+                        ("ssim", "best_ssim.ckpt"),
+                        ("psnr", "best_psnr.ckpt"),
+                        ("proxy", "best_proxy.ckpt"),
+                    ):
+                        if current[metric] > best[metric]:
+                            best[metric] = current[metric]
+                            save_checkpoint(output_dir / filename, self.model, **save_kwargs)
+                    if save_top_k:
+                        rank = (current["ssim"], current["psnr"])
+                        qualifies = (
+                            len(self._top_checkpoints) < save_top_k
+                            or rank > self._top_checkpoints[-1][0]
                         )
-                        save_checkpoint(top_path, self.model, **save_kwargs)
-                        self._top_checkpoints.append((rank, top_path))
-                        self._top_checkpoints.sort(key=lambda item: item[0], reverse=True)
-                        while len(self._top_checkpoints) > save_top_k:
-                            _, stale = self._top_checkpoints.pop()
-                            stale.unlink(missing_ok=True)
-            if validator is not None:
+                        if qualifies:
+                            top_path = output_dir / "top_k" / (
+                                f"epoch_{epoch:04d}_ssim_{current['ssim']:.6f}.ckpt"
+                            )
+                            save_checkpoint(top_path, self.model, **save_kwargs)
+                            self._top_checkpoints.append((rank, top_path))
+                            self._top_checkpoints.sort(key=lambda item: item[0], reverse=True)
+                            while len(self._top_checkpoints) > save_top_k:
+                                _, stale = self._top_checkpoints.pop()
+                                stale.unlink(missing_ok=True)
+                entry["checkpoint_duration_seconds"] = float(
+                    time.perf_counter() - checkpoint_start
+                )
+            if validator is not None and is_validation_epoch:
                 previous_best = max(
                     (
                         float(item.get("validation", {}).get("macro", {}).get("mean_ssim", -float("inf")))
                         for item in self.metric_history[:-1]
+                        if item.get("validated", False)
                     ),
                     default=-float("inf"),
                 )

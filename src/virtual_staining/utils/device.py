@@ -71,14 +71,29 @@ def resolve_device(requested: str = "auto") -> torch.device:
 
 
 def hardware_profile() -> dict[str, Any]:
-    """Return conservative local training defaults from total GPU memory."""
+    """Return training defaults for the single supported target: RTX 5090.
+
+    The project now targets only AutoDL RTX 5090 (Blackwell, 32GB GDDR7).
+    The 8GB/16GB/20GB compatibility branches have been removed in favour of a
+    single ``rtx_5090`` profile: base_channels=64, batch_size=8,
+    gradient_accumulation=2 (effective batch 16), num_workers=8. A CPU
+    fallback is retained so non-training CLI commands (env, audit, discover)
+    keep working on machines without CUDA.
+    """
 
     if not torch.cuda.is_available():
-        return {"name": "cpu", "base_channels": 16, "batch_size": 1, "gradient_accumulation": 1}
-    total_gib = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    if total_gib <= 8.25:
-        return {"name": "gpu_8gb", "base_channels": 32, "batch_size": 2, "gradient_accumulation": 4}
-    if total_gib < 20:
-        return {"name": "gpu_16gb", "base_channels": 48, "batch_size": 4, "gradient_accumulation": 2}
-    return {"name": "gpu_20gb_plus", "base_channels": 64, "batch_size": 8, "gradient_accumulation": 1}
+        return {
+            "name": "cpu",
+            "base_channels": 16,
+            "batch_size": 1,
+            "gradient_accumulation": 1,
+            "num_workers": 0,
+        }
+    return {
+        "name": "rtx_5090",
+        "base_channels": 64,
+        "batch_size": 8,
+        "gradient_accumulation": 2,
+        "num_workers": 8,
+    }
 
