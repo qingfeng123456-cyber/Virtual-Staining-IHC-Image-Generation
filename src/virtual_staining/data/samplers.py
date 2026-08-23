@@ -78,7 +78,7 @@ class GroupInterleavedSampler(Sampler[int]):
 class ActivityStratifiedSampler(Sampler[int]):
     """Quantile-balanced sampling from precomputed training-only activity values."""
 
-    _STATE_VERSION = 1
+    _STATE_VERSION = 2
 
     def __init__(
         self,
@@ -89,6 +89,9 @@ class ActivityStratifiedSampler(Sampler[int]):
         num_bins: int = 4,
         seed: int = 2026,
         num_samples: int | None = None,
+        strategy: str = "balanced",
+        start_epoch: int = 0,
+        hard_fraction: float = 0.0,
     ) -> None:
         if len(activities) == 0:
             raise ValueError("activities cannot be empty")
@@ -126,6 +129,15 @@ class ActivityStratifiedSampler(Sampler[int]):
             or num_samples < 1
         ):
             raise ValueError("num_samples must be a positive integer when provided")
+        normalized_strategy = str(strategy).strip().casefold()
+        if normalized_strategy not in {"balanced", "hard_mix"}:
+            raise ValueError("strategy must be balanced or hard_mix")
+        if isinstance(start_epoch, bool) or not isinstance(start_epoch, int) or start_epoch < 0:
+            raise ValueError("start_epoch must be a nonnegative integer")
+        if not math.isfinite(float(hard_fraction)) or not 0.0 <= float(hard_fraction) < 1.0:
+            raise ValueError("hard_fraction must lie in [0, 1)")
+        if normalized_strategy == "hard_mix" and float(hard_fraction) <= 0.0:
+            raise ValueError("hard_mix requires a positive hard_fraction")
         values = tuple(float(value) for value in activities)
         if any(not math.isfinite(value) for value in values):
             raise ValueError("activities must contain finite numeric values")
@@ -136,6 +148,9 @@ class ActivityStratifiedSampler(Sampler[int]):
         self.num_bins = num_bins
         self.seed = seed
         self.num_samples = num_samples or len(values)
+        self.strategy = normalized_strategy
+        self.start_epoch = int(start_epoch)
+        self.hard_fraction = float(hard_fraction)
         sorted_values = sorted(values)
         boundaries: list[float] = []
         for quantile_index in range(1, num_bins):
@@ -164,10 +179,25 @@ class ActivityStratifiedSampler(Sampler[int]):
         self.bin_by_sample_index = dict(zip(resolved_indices, assignments, strict=True))
         self.epoch = 0
         self._position = 0
+        legacy_fingerprint_payload = "|".join(
+            [
+                str(num_bins),
+                str(self.num_samples),
+                *(str(index) for index in resolved_indices),
+                *normalized_splits,
+                *(repr(v) for v in values),
+            ]
+        )
+        self._legacy_fingerprint = hashlib.sha256(
+            legacy_fingerprint_payload.encode()
+        ).hexdigest()
         fingerprint_payload = "|".join(
             [
                 str(num_bins),
                 str(self.num_samples),
+                self.strategy,
+                str(self.start_epoch),
+                repr(self.hard_fraction),
                 *(str(index) for index in resolved_indices),
                 *normalized_splits,
                 *(repr(v) for v in values),
@@ -186,6 +216,9 @@ class ActivityStratifiedSampler(Sampler[int]):
         num_bins: int = 4,
         seed: int = 2026,
         num_samples: int | None = None,
+        strategy: str = "balanced",
+        start_epoch: int = 0,
+        hard_fraction: float = 0.0,
     ) -> ActivityStratifiedSampler:
         """Read precomputed scalar fields only; this method performs no image I/O."""
 
@@ -201,6 +234,9 @@ class ActivityStratifiedSampler(Sampler[int]):
             num_bins=num_bins,
             seed=seed,
             num_samples=num_samples,
+            strategy=strategy,
+            start_epoch=start_epoch,
+            hard_fraction=hard_fraction,
         )
 
     @property
@@ -215,6 +251,25 @@ class ActivityStratifiedSampler(Sampler[int]):
 
     def _epoch_order(self) -> list[int]:
         rng = random.Random(self.seed + self.epoch)
+        if self.strategy == "hard_mix":
+            all_indices = list(self.sample_indices)
+            rng.shuffle(all_indices)
+            if self.epoch < self.start_epoch:
+                return [
+                    all_indices[index % len(all_indices)]
+                    for index in range(self.num_samples)
+                ]
+            hard_pool = list(self._bins[-1])
+            rng.shuffle(hard_pool)
+            hard_count = int(round(self.num_samples * self.hard_fraction))
+            uniform_count = self.num_samples - hard_count
+            uniform = [
+                all_indices[index % len(all_indices)] for index in range(uniform_count)
+            ]
+            hard = [hard_pool[index % len(hard_pool)] for index in range(hard_count)]
+            order = [*uniform, *hard]
+            rng.shuffle(order)
+            return order
         pools = [list(values) for values in self._bins]
         for pool in pools:
             rng.shuffle(pool)
@@ -252,12 +307,27 @@ class ActivityStratifiedSampler(Sampler[int]):
             "position": self._position,
             "num_samples": self.num_samples,
             "num_bins": self.num_bins,
+            "strategy": self.strategy,
+            "start_epoch": self.start_epoch,
+            "hard_fraction": self.hard_fraction,
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        if int(state.get("version", -1)) != self._STATE_VERSION:
+        version = int(state.get("version", -1))
+        if version not in {1, self._STATE_VERSION}:
             raise ValueError("Unsupported activity sampler state version")
-        if str(state.get("fingerprint", "")) != self._fingerprint:
+        expected_fingerprint = (
+            self._legacy_fingerprint if version == 1 else self._fingerprint
+        )
+        if version == 1 and (
+            self.strategy != "balanced"
+            or self.start_epoch != 0
+            or self.hard_fraction != 0.0
+        ):
+            raise ValueError(
+                "Legacy activity sampler state can resume only the balanced strategy"
+            )
+        if str(state.get("fingerprint", "")) != expected_fingerprint:
             raise ValueError("Activity sampler state does not match current training data")
         if int(state.get("seed", -1)) != self.seed:
             raise ValueError("Activity sampler state seed does not match")

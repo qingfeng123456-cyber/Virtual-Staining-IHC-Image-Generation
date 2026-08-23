@@ -15,7 +15,11 @@ from typing import Any
 import numpy as np
 import psutil
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
+
+from virtual_staining.data.transforms import apply_context_d4, apply_d4, invert_d4
+from virtual_staining.utils.gpu_monitor import NvidiaSmiMonitor
 
 from .checkpoint import save_checkpoint
 from .common import (
@@ -32,6 +36,7 @@ from .common import (
 )
 from .ema import ExponentialMovingAverage
 from .gradient_monitor import GradientCosineMonitor
+from .optim import build_adamw_optimizer
 from .prototype_monitor import PrototypeUsageMonitor
 
 
@@ -352,10 +357,17 @@ class Trainer:
         weight_decay = float(config_get(config, "train.weight_decay", 1e-4))
         learned_loss_parameters = loss_optimizer_parameters(self.loss_fn)
         if optimizer is None:
-            self.optimizer = torch.optim.AdamW(
-                collect_optimizer_parameters(self.model, self.loss_fn),
-                lr=learning_rate,
+            optimizer_options = config_get(config, "train.optimizer_options", {})
+            self.optimizer = build_adamw_optimizer(
+                self.model,
+                self.loss_fn,
+                learning_rate=learning_rate,
                 weight_decay=weight_decay,
+                options=(
+                    optimizer_options
+                    if isinstance(optimizer_options, Mapping)
+                    else None
+                ),
             )
         else:
             self.optimizer = optimizer
@@ -368,6 +380,9 @@ class Trainer:
             if missing:
                 self.optimizer.add_param_group({"params": missing})
         self._optimizer_parameters = _optimizer_parameters(self.optimizer)
+        self.optimizer_report = dict(
+            getattr(self.optimizer, "virtual_staining_report", {})
+        )
         self.scheduler = scheduler if scheduler is not None else _build_configured_scheduler(
             self.optimizer, config
         )
@@ -395,6 +410,7 @@ class Trainer:
         self.global_step = 0
         self.oom_retries = 0
         self.microbatch_factor = 1
+        self._oom_cleared_accumulated_gradients = False
         self.metric_history: list[dict[str, Any]] = []
         self._top_checkpoints: list[tuple[tuple[float, float], Path]] = []
         monitor_enabled = bool(config_get(config, "train.prototype_monitor.enabled", False))
@@ -476,6 +492,91 @@ class Trainer:
         # Profiler trace directory is populated lazily by _maybe_start_profiler;
         # initialize it so attribute access is always safe.
         self._profiler_trace_dir: Path | None = None
+        equivariance = config_get(config, "train.equivariance", {}) or {}
+        if not isinstance(equivariance, Mapping):
+            equivariance = {}
+        self.equivariance_enabled = bool(equivariance.get("enabled", False))
+        self.equivariance_probability = float(equivariance.get("probability", 0.0))
+        self.equivariance_max_weight = float(equivariance.get("weight", 0.0))
+        self.equivariance_start_ratio = float(equivariance.get("start_ratio", 0.10))
+        self.equivariance_ramp_end_ratio = float(
+            equivariance.get("ramp_end_ratio", 0.40)
+        )
+        self.equivariance_beta = float(equivariance.get("smooth_l1_beta", 0.01))
+        self._equivariance_weight = 0.0
+        gpu_monitor = config_get(config, "train.gpu_monitor", {}) or {}
+        if not isinstance(gpu_monitor, Mapping):
+            gpu_monitor = {}
+        self.gpu_monitor_enabled = bool(gpu_monitor.get("enabled", False))
+        self.gpu_monitor_interval = float(gpu_monitor.get("interval_seconds", 2.0))
+
+    def _equivariance_weight_at(self, progress: float) -> float:
+        if not self.equivariance_enabled or progress <= self.equivariance_start_ratio:
+            return 0.0
+        span = self.equivariance_ramp_end_ratio - self.equivariance_start_ratio
+        fraction = min(1.0, max(0.0, (progress - self.equivariance_start_ratio) / span))
+        return self.equivariance_max_weight * (
+            0.5 - 0.5 * math.cos(math.pi * fraction)
+        )
+
+    @staticmethod
+    def _transform_context_kwargs(
+        model_kwargs: Mapping[str, Any], transform_id: int
+    ) -> dict[str, Any]:
+        transformed = dict(model_kwargs)
+        tiles = transformed.get("context_tiles")
+        mask = transformed.get("context_valid_mask")
+        offsets = transformed.get("context_offsets")
+        if not all(isinstance(value, Tensor) for value in (tiles, mask, offsets)):
+            return transformed
+        if tiles.ndim != 5 or mask.ndim != 2 or offsets.ndim != 3:
+            raise ValueError(
+                "Batched context must be [B,N,C,H,W], [B,N], and [B,N,2]"
+            )
+        batches = [
+            apply_context_d4(
+                tiles[index], mask[index], offsets[index], transform_id
+            )
+            for index in range(tiles.shape[0])
+        ]
+        transformed["context_tiles"] = torch.stack([item[0] for item in batches])
+        transformed["context_valid_mask"] = torch.stack([item[1] for item in batches])
+        transformed["context_offsets"] = torch.stack([item[2] for item in batches])
+        return transformed
+
+    def _equivariance_loss(
+        self,
+        base_predictions: Mapping[str, Tensor],
+        inputs: Tensor,
+        task_name: str | None,
+        model_kwargs: Mapping[str, Any],
+        transform_id: int,
+    ) -> Tensor:
+        transformed_inputs = self._to_channels_last(apply_d4(inputs, transform_id))
+        transformed_kwargs = self._transform_context_kwargs(
+            model_kwargs, transform_id
+        )
+        transformed_output = call_model(
+            self.model,
+            transformed_inputs,
+            task_name,
+            model_kwargs=transformed_kwargs,
+        )
+        transformed_predictions = extract_predictions(transformed_output)
+        if set(transformed_predictions) != set(base_predictions):
+            raise KeyError(
+                "Equivariance branch changed prediction tasks: "
+                f"{sorted(base_predictions)} != {sorted(transformed_predictions)}"
+            )
+        values = [
+            F.smooth_l1_loss(
+                invert_d4(transformed_predictions[name], transform_id).float(),
+                base_predictions[name].float(),
+                beta=self.equivariance_beta,
+            )
+            for name in base_predictions
+        ]
+        return torch.stack(values).mean()
 
     @staticmethod
     def _resolve_progress_bar_enabled(value: Any) -> bool:
@@ -813,15 +914,29 @@ class Trainer:
         effective_task = self.task_name
         if effective_task is None and len(targets) == 1:
             effective_task = next(iter(targets))
+        model_kwargs = model_kwargs_from_metadata(metadata)
+        apply_equivariance = (
+            self.equivariance_enabled
+            and self._equivariance_weight > 0.0
+            and random.random() < self.equivariance_probability
+        )
         with self._autocast():
             output = call_model(
                 self.model,
                 inputs,
                 effective_task,
-                model_kwargs=model_kwargs_from_metadata(metadata),
+                model_kwargs=model_kwargs,
             )
             total, components, per_task = self._compute_loss(
                 output, targets, keep_on_device=keep_on_device
+            )
+            base_predictions = (
+                {
+                    name: prediction.detach()
+                    for name, prediction in extract_predictions(output).items()
+                }
+                if apply_equivariance
+                else {}
             )
             if (
                 len(per_task) > 1
@@ -851,13 +966,53 @@ class Trainer:
             self.scaler.scale(scaled_loss).backward()
         else:
             scaled_loss.backward()
+        equivariance_value = total.detach().new_zeros(())
+        if apply_equivariance:
+            transform_id = random.randint(1, 7)
+            with self._autocast():
+                equivariance_value = self._equivariance_loss(
+                    base_predictions,
+                    inputs,
+                    effective_task,
+                    model_kwargs,
+                    transform_id,
+                )
+            if not torch.isfinite(equivariance_value.detach()).all():
+                raise FloatingPointError(
+                    "Equivariance consistency loss must be finite"
+                )
+            scaled_equivariance = (
+                self._equivariance_weight * equivariance_value / float(loss_divisor)
+            )
+            if self.scaler.is_enabled():
+                self.scaler.scale(scaled_equivariance).backward()
+            else:
+                scaled_equivariance.backward()
+        weighted_equivariance = self._equivariance_weight * equivariance_value.detach()
+        logged_total = total.detach() + weighted_equivariance
+        if keep_on_device:
+            components["equivariance/raw"] = equivariance_value.detach()
+            components["equivariance/weighted"] = weighted_equivariance
+            components["equivariance/applied"] = total.detach().new_tensor(
+                float(apply_equivariance)
+            )
+            components["equivariance/weight"] = total.detach().new_tensor(
+                self._equivariance_weight
+            )
+        else:
+            components["equivariance/raw"] = float(equivariance_value.detach().cpu())
+            components["equivariance/weighted"] = float(
+                weighted_equivariance.detach().cpu()
+            )
+            components["equivariance/applied"] = float(apply_equivariance)
+            components["equivariance/weight"] = self._equivariance_weight
         if self.prototype_monitor is not None:
             self.prototype_monitor.observe(output)
         if keep_on_device:
             # Return detached 0-dim on-device tensors; the caller accumulates
             # them and synchronizes once per epoch (or every N batches).
-            return total.detach(), components
-        return float(total.detach().cpu()), components
+            return logged_total, components
+        return float(logged_total.cpu()), components
 
     def _run_batch_with_oom_recovery(
         self, batch: Any, *, keep_on_device: bool = False
@@ -903,6 +1058,13 @@ class Trainer:
                 if self.device.type != "cuda" or not _is_cuda_oom(error):
                     raise
                 self.optimizer.zero_grad(set_to_none=True)
+                # A failed microbatch may already have contributed gradients,
+                # and earlier DataLoader batches may have been accumulating.
+                # Retry the complete batch from a clean state and tell the
+                # epoch loop to restart its accumulation window.  Splitting a
+                # DataLoader batch must not alter the configured effective
+                # batch size.
+                self._oom_cleared_accumulated_gradients = True
                 torch.cuda.empty_cache()
                 self.oom_retries += 1
                 if self.oom_retries > 3 or chunk_size == 1:
@@ -910,7 +1072,6 @@ class Trainer:
                         "CUDA OOM persisted after at most three batch-size reductions"
                     ) from error
                 self.microbatch_factor *= 2
-                self.gradient_accumulation *= 2
 
     def _optimizer_step(self) -> None:
         if self.scaler.is_enabled():
@@ -1001,6 +1162,10 @@ class Trainer:
         set_sampler_epoch = getattr(activity_plan, "set_epoch", None)
         if callable(set_sampler_epoch):
             set_sampler_epoch(int(epoch))
+        schedule_progress = (
+            float(epoch) / max(1, int(total_epochs or epoch + 1) - 1)
+        )
+        self._equivariance_weight = self._equivariance_weight_at(schedule_progress)
         self.model.train()
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -1016,6 +1181,7 @@ class Trainer:
         batch_count = len(self.dataloader) if hasattr(self.dataloader, "__len__") else None
         seen_batches = 0
         seen_samples = 0
+        accumulated_batches = 0
         progress = self._create_progress_bar(
             epoch=epoch, total_epochs=total_epochs, total=batch_count
         )
@@ -1024,6 +1190,13 @@ class Trainer:
         # overhead; when enabled it records CPU/CUDA time, DataLoader waits and
         # memory, then writes a Chrome trace for offline analysis on AutoDL.
         profiler = self._maybe_start_profiler(epoch)
+        gpu_monitor = NvidiaSmiMonitor(
+            enabled=self.gpu_monitor_enabled and self.device.type == "cuda",
+            interval_seconds=self.gpu_monitor_interval,
+            device_index=int(self.device.index or 0),
+        )
+        gpu_monitor.start()
+        epoch_loop_completed = False
         try:
             for batch_index, batch in enumerate(self.dataloader):
                 batch_samples = infer_batch_size(batch)
@@ -1040,9 +1213,14 @@ class Trainer:
                     for key, value in logged.items():
                         components[key].append(float(value))
                 seen_batches += 1
+                if self._oom_cleared_accumulated_gradients:
+                    accumulated_batches = 0
+                    self._oom_cleared_accumulated_gradients = False
+                accumulated_batches += 1
                 is_last = batch_count is not None and batch_index + 1 == batch_count
-                if (batch_index + 1) % self.gradient_accumulation == 0 or is_last:
+                if accumulated_batches >= self.gradient_accumulation or is_last:
                     self._optimizer_step()
+                    accumulated_batches = 0
                 if profiler is not None:
                     profiler.step()
                 if progress is not None:
@@ -1073,19 +1251,23 @@ class Trainer:
                         )
                     progress.set_postfix(postfix, refresh=False)
                     progress.update(1)
+            epoch_loop_completed = True
         finally:
             if progress is not None:
                 progress.close()
             if profiler is not None:
                 self._finalize_profiler(profiler, epoch)
+            if not epoch_loop_completed:
+                gpu_monitor.stop()
         if seen_batches == 0:
             raise ValueError("Training dataloader produced no batches")
-        if batch_count is None and seen_batches % self.gradient_accumulation:
+        if batch_count is None and accumulated_batches:
             self._optimizer_step()
         if self.scheduler is not None:
             self.scheduler.step()
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
+        gpu_monitor_summary = gpu_monitor.stop()
         duration_seconds = float(time.perf_counter() - started)
         if async_buffer is not None:
             mean_loss, component_means = async_buffer.sync()
@@ -1123,9 +1305,16 @@ class Trainer:
             "float32_matmul_precision": self.float32_matmul_precision,
             "torch_compile_enabled": bool(self.compile_enabled),
             "channels_last_enabled": bool(self.channels_last_enabled),
+            "optimizer/fused_enabled": bool(
+                self.optimizer_report.get("fused_enabled", False)
+            ),
+            "optimizer/group_count": int(
+                self.optimizer_report.get("group_count", len(self.optimizer.param_groups))
+            ),
         }
         for key, value in component_means.items():
             result[f"loss/{key}"] = value
+        result.update(gpu_monitor_summary)
         if self.prototype_monitor is not None:
             prototype_summary = self.prototype_monitor.finalize_epoch(epoch)
             if prototype_summary["total_prototypes"]:
@@ -1172,6 +1361,12 @@ class Trainer:
             "enabled" if self.progress_bar_enabled else "disabled (non-interactive terminal or config)",
         )
         output_dir = Path(checkpoint_dir).resolve() if checkpoint_dir is not None else None
+        fit_started = time.perf_counter()
+        max_wall_time_hours = float(
+            config_get(self.config, "train.max_wall_time_hours", 0.0) or 0.0
+        )
+        time_budget_seconds = max_wall_time_hours * 3600.0
+        completed_epoch_durations: list[float] = []
         activity_plan = getattr(self, "activity_sampling_plan", None)
         if self.prototype_monitor is not None and output_dir is not None:
             self.prototype_monitor.bind_output_dir(output_dir.parent / "artifacts")
@@ -1247,6 +1442,7 @@ class Trainer:
             self._top_checkpoints.sort(key=lambda item: item[0], reverse=True)
             self._top_checkpoints = self._top_checkpoints[:save_top_k]
         for epoch in range(start_epoch, total_epochs):
+            epoch_wall_started = time.perf_counter()
             set_progress = getattr(self.loss_fn, "set_progress", None)
             if callable(set_progress):
                 set_progress(epoch=epoch, total_epochs=total_epochs)
@@ -1324,6 +1520,30 @@ class Trainer:
                     float(train_metrics["images_per_second"]),
                     validate_every,
                 )
+            epoch_wall_seconds = float(time.perf_counter() - epoch_wall_started)
+            completed_epoch_durations.append(epoch_wall_seconds)
+            fit_elapsed_seconds = float(time.perf_counter() - fit_started)
+            recent = completed_epoch_durations[-3:]
+            estimated_next_epoch_seconds = float(np.median(recent))
+            epochs_until_next_safe_stop = validate_every if validator is not None else 1
+            estimated_next_safe_stop_seconds = (
+                estimated_next_epoch_seconds * epochs_until_next_safe_stop
+            )
+            time_budget_stop = bool(
+                time_budget_seconds > 0.0
+                and epoch < total_epochs - 1
+                and (validator is None or is_validation_epoch)
+                and fit_elapsed_seconds + estimated_next_safe_stop_seconds
+                >= time_budget_seconds
+            )
+            entry["fit_elapsed_seconds"] = fit_elapsed_seconds
+            entry["epoch_wall_seconds"] = epoch_wall_seconds
+            entry["time_budget_seconds"] = time_budget_seconds
+            entry["estimated_next_epoch_seconds"] = estimated_next_epoch_seconds
+            entry["estimated_next_safe_stop_seconds"] = (
+                estimated_next_safe_stop_seconds
+            )
+            entry["stopped_by_time_budget"] = time_budget_stop
             self._notify_epoch_callbacks(entry)
             if output_dir is not None:
                 checkpoint_start = time.perf_counter()
@@ -1459,6 +1679,17 @@ class Trainer:
                 entry["checkpoint_duration_seconds"] = float(
                     time.perf_counter() - checkpoint_start
                 )
+            if time_budget_stop:
+                logging.getLogger("virtual_staining").warning(
+                    "Stopping after epoch %d to respect the %.2f-hour training "
+                    "budget (elapsed %.2f hours; next safe validation/checkpoint "
+                    "estimate %.1f seconds)",
+                    epoch + 1,
+                    max_wall_time_hours,
+                    float(time.perf_counter() - fit_started) / 3600.0,
+                    estimated_next_safe_stop_seconds,
+                )
+                break
             if validator is not None and is_validation_epoch:
                 previous_best = max(
                     (

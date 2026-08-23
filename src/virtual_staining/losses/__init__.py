@@ -1,6 +1,12 @@
 """Differentiable objectives for image restoration training."""
 
 from .charbonnier import CharbonnierLoss, structure_weight_map
+from .competition_proxy import (
+    CompetitionProxyLoss,
+    CompetitionProxyOutput,
+    capped_per_image_psnr_loss,
+    uniform_window_ssim,
+)
 from .composite import (
     CompositeRestorationLoss,
     LossOutput,
@@ -49,6 +55,8 @@ from .statistics import IntensityStatisticsLoss
 
 __all__ = [
     "CharbonnierLoss",
+    "CompetitionProxyLoss",
+    "CompetitionProxyOutput",
     "CompositeRestorationLoss",
     "DifferentiableSSIM",
     "FrequencyAmplitudeLoss",
@@ -73,6 +81,7 @@ __all__ = [
     "DEFAULT_PHASE_B",
     "build_gaussian_pyramid",
     "build_laplacian_pyramid",
+    "capped_per_image_psnr_loss",
     "differentiable_ms_ssim",
     "differentiable_ssim",
     "epoch_progress",
@@ -85,4 +94,5 @@ __all__ = [
     "sobel_gradients",
     "structure_weight_map",
     "task_correlation_loss",
+    "uniform_window_ssim",
 ]

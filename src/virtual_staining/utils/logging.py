@@ -140,6 +140,7 @@ def _module_inventory(model: Any) -> dict[str, Any]:
         "trainable_parameters": int(
             sum(parameter.numel() for parameter in all_parameters if parameter.requires_grad)
         ),
+        "feature_flags": _to_jsonable(getattr(model, "feature_flags", {})),
         "top_level_modules": modules,
         "note": (
             "Parameter counts are structural module sizes. Runtime performance is "

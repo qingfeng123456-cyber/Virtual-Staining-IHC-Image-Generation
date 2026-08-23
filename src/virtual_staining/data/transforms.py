@@ -388,7 +388,18 @@ class ContextPairedTransform:
         )
         augmented, _ = self._intensity_transform(combined, {}, generator=generator)
         sample["input"] = augmented[0]
-        sample["context_tiles"] = augmented[1:]
+        augmented_tiles = augmented[1:]
+        transformed_offsets = sample["context_offsets"]
+        if not isinstance(transformed_offsets, torch.Tensor):
+            raise TypeError("Transformed context offsets must be a tensor")
+        center_slots = (transformed_offsets == 0).all(dim=-1)
+        if center_slots.any():
+            # The center appears both as the main input and as one context tile.
+            # Noise is sampled per pixel, so explicitly restore that identity
+            # after the shared intensity transform.
+            augmented_tiles = augmented_tiles.clone()
+            augmented_tiles[center_slots] = augmented[0]
+        sample["context_tiles"] = augmented_tiles
         return sample
 
 

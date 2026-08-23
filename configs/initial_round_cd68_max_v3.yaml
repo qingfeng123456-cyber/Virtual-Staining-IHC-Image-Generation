@@ -1,0 +1,222 @@
+# RTX 4090, <=9-hour performance candidate for the official CD68 task.
+#
+# This does not replace the validated v2 control. Every new behavior below is
+# feature-flagged; promote this config only after ROI-grouped JPG validation.
+project:
+  output_root: outputs/initial_round_max_v3
+  artifact_root: artifacts
+  seed: 2026
+
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  image_size: 256
+  # Official JPEGs are stored as RGB, but every channel is pixel-identical.
+  # Model in one logical channel and restore RGB only when writing the ZIP.
+  input_channels: 1
+  target_channels:
+    CD68: 1
+  # Keep the exact same ROI split when project.seed changes for a second model.
+  split_seed: 2026
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  activity_sampler:
+    enabled: true
+    activity_key: target_activity
+    num_bins: 4
+    strategy: hard_mix
+    # Only the last 22% of epochs emphasize the empirically weak high-activity bin.
+    start_ratio: 0.78
+    hard_fraction: 0.30
+
+model:
+  name: multi_marker_restorer
+  base_channels: 64
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  # Two restoration paths operate at the 1/8 bottleneck: local NAF and a
+  # float32 low/high-frequency FFT branch. A channel-wise gate fuses them and
+  # a zero-initialized residual scale keeps the first update stable.
+  spatial_frequency:
+    enabled: true
+    spatial_depth: 1
+    spatial_expansion: 1
+    gate_reduction: 8
+    frequency_cutoff: 0.35
+    frequency_transition_width: 0.08
+    residual_init: 0.0
+  # A sub-million-parameter convolutional U branch follows a second multi-scale
+  # path and injects decoded detail features into the 1/1, 1/2 and 1/4 skips.
+  lightweight_unet:
+    enabled: true
+    widths: [16, 24, 32, 48]
+    depths: [1, 1, 1, 1]
+    kernel_size: 7
+    expansion: 2
+    fusion_scales: [1, 2, 4]
+    residual_init: 0.0
+  base_detail: true
+  # Learn base/detail only as zero-initialized corrections to the proven direct
+  # output head, so epoch zero is exactly the direct restoration prediction.
+  base_detail_residual: true
+  max_detail_amplitude: 0.5
+  context:
+    enabled: true
+    grid_size: 3
+    missing_policy: center
+    include_center: true
+    token_dim: 64
+    encoder_width: 16
+    encoder_depth: 1
+    # Keep the same verified neighbor set in the original and D4 consistency
+    # forwards; independent token dropout would turn equivariance into noise.
+    context_dropout: 0.0
+    fusion_scales: [4, 8]
+    bottleneck_cross_attention: true
+    cross_attention_heads: 4
+    residual_init: 0.0
+    stop_gradient: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 512
+
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.45
+  interpolation: cosine
+  phase_a:
+    mse: 0.20
+    charbonnier: 0.38
+    ssim: 0.30
+    ms_ssim: 0.05
+    pyramid: 0.02
+    gradient: 0.05
+    statistics: 0.0
+  # Freeze near the empirically best epoch-57/60 objective instead of moving
+  # farther toward the v2 endpoint that coincided with validation regression.
+  phase_b:
+    mse: 0.29
+    charbonnier: 0.29
+    ssim: 0.33
+    ms_ssim: 0.02
+    pyramid: 0.02
+    gradient: 0.04
+    statistics: 0.01
+  deep_supervision_weights: [1.0, 0.5, 0.25]
+  deep_supervision_final_weights: [1.0, 0.1, 0.05]
+  competition_proxy:
+    enabled: true
+    weight: 0.06
+    start_ratio: 0.55
+    ssim_weight: 0.70
+    window_size: 7
+    psnr_cap: 60.0
+  frequency: 0.01
+  correlation: 0.0
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+  fluorescence_foreground:
+    # The v2 foreground candidate did not beat the immutable no-TTA baseline.
+    enabled: false
+    weight: 0.0
+
+augmentation:
+  max_translation: 0
+  horizontal_flip_probability: 0.5
+  vertical_flip_probability: 0.5
+  rotate_probability: 1.0
+  gamma_range: [0.9, 1.1]
+  gamma_probability: 0.5
+  brightness_delta: 0.05
+  brightness_probability: 0.5
+  contrast_range: [0.95, 1.05]
+  contrast_probability: 0.5
+  noise_std: 0.005
+  noise_probability: 0.25
+
+train:
+  device: cuda
+  epochs: 72
+  batch_size: 12
+  gradient_accumulation: 1
+  lr: 0.00018
+  weight_decay: 0.0001
+  warmup_epochs: 4
+  scheduler: cosine
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.999
+  # The old long run favored EMA, but new zero-init branches may learn on a
+  # different clock. Compare both so checkpoint selection cannot assume EMA.
+  evaluate_weight_sources: [raw, ema]
+  early_stopping_patience: 5
+  save_top_k: 0
+  checkpoint_metrics: [ssim, proxy]
+  validate_every_n_epochs: 3
+  retain_validation_records_in_history: false
+  async_metric_logging: true
+  batch_metric_log_interval: 0
+  # Applies to Trainer.fit. The lower guard leaves time for audit and final D4.
+  max_wall_time_hours: 6.5
+  float32_matmul_precision: high
+  channels_last: true
+  cudnn_benchmark: true
+  optimizer_options:
+    enabled: true
+    no_decay_norm_bias: true
+    fused: auto
+  equivariance:
+    enabled: true
+    probability: 0.25
+    weight: 0.015
+    start_ratio: 0.10
+    ramp_end_ratio: 0.40
+    smooth_l1_beta: 0.01
+  gpu_monitor:
+    enabled: true
+    interval_seconds: 2.0
+  compile:
+    # Keep eager checkpoint keys until compiled/eager resume is fully benchmarked.
+    enabled: false
+    mode: reduce-overhead
+    backend: inductor
+  prototype_monitor:
+    enabled: true
+    dead_threshold: 0.0001
+    attention_visuals_enabled: false
+
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: d4
+  tta_policy: configured
+
+pretrain:
+  enabled: false
+
+multitask:
+  optimizer: equal
+  gradient_cosine_enabled: false
+
+submission:
+  official: true
+  allow_smoke_manifest: false

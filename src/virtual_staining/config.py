@@ -26,6 +26,8 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "smoke_count", "image_size", "input_mode", "target_modes", "num_workers",
         "pin_memory", "persistent_workers", "max_train_samples", "max_val_samples",
         "input_channels", "target_channels", "grouped_inner_folds", "activity_sampler",
+        "split_seed",
+        "prefetch_factor",
     },
     "model": {
         "name", "base_channels", "encoder_depths", "decoder_depths", "use_sobel_input",
@@ -34,12 +36,14 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "decoder_mode", "output_activation", "local_encoder", "context", "global_mixer",
         "conditioning", "adapters", "prototypes", "output", "intensity_calibrator",
         "organ_names", "context_stop_gradient", "use_laplacian_input", "base_detail",
-        "max_detail_amplitude",
+        "base_detail_residual", "max_detail_amplitude", "spatial_frequency",
+        "lightweight_unet",
     },
     "loss": {
         "charbonnier", "ssim", "ms_ssim", "gradient", "frequency",
         "structure_weight_alpha", "correlation", "prototype_activation",
         "prototype_diversity", "deep_supervision_weights", "task_weights",
+        "deep_supervision_final_weights", "competition_proxy",
         "auto_balance", "auto_balance_decay", "data_range", "mse", "pyramid",
         "statistics", "schedule", "phase_a_ratio", "phase_a", "phase_b",
         "prototype", "shift_tolerant", "fluorescence_foreground", "transition",
@@ -58,6 +62,10 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "float32_matmul_precision", "profiler", "compile",
         "channels_last", "cudnn_benchmark", "retain_validation_records_in_history",
         "checkpoint_metrics",
+        "optimizer_options",
+        "equivariance",
+        "max_wall_time_hours",
+        "gpu_monitor",
     },
     "validation": {
         "device", "task_name", "primary_metric", "psnr_norm_min", "psnr_norm_max",
@@ -115,6 +123,7 @@ _NESTED_ALLOWED: dict[tuple[str, str], set[str]] = {
     },
     ("data", "activity_sampler"): {
         "enabled", "activity_key", "num_bins", "seed", "num_samples",
+        "strategy", "start_ratio", "hard_fraction",
     },
     ("model", "local_encoder"): {
         "type", "widths", "depths", "drop_path", "use_laplacian_input",
@@ -126,6 +135,14 @@ _NESTED_ALLOWED: dict[tuple[str, str], set[str]] = {
         "require_verified_grid", "coordinate_source", "allow_numeric_stem_inference",
         "allow_edge_graph_inference", "tile_chunk_size", "encoder_depth",
         "cross_attention_heads", "cache_size",
+    },
+    ("model", "spatial_frequency"): {
+        "enabled", "spatial_depth", "spatial_expansion", "gate_reduction",
+        "frequency_cutoff", "frequency_transition_width", "residual_init",
+    },
+    ("model", "lightweight_unet"): {
+        "enabled", "widths", "depths", "kernel_size", "expansion",
+        "fusion_scales", "residual_init",
     },
     ("model", "global_mixer"): {
         "enabled", "type", "blocks_1_8", "blocks_1_16", "heads", "heads_1_8",
@@ -161,6 +178,16 @@ _NESTED_ALLOWED: dict[tuple[str, str], set[str]] = {
     ("train", "compile"): {
         "enabled", "mode", "backend",
     },
+    ("train", "optimizer_options"): {
+        "enabled", "no_decay_norm_bias", "fused",
+    },
+    ("train", "equivariance"): {
+        "enabled", "probability", "weight", "start_ratio", "ramp_end_ratio",
+        "smooth_l1_beta",
+    },
+    ("train", "gpu_monitor"): {
+        "enabled", "interval_seconds",
+    },
     ("loss", "phase_a"): {
         "mse", "charbonnier", "ssim", "ms_ssim", "pyramid", "gradient", "statistics",
     },
@@ -174,6 +201,10 @@ _NESTED_ALLOWED: dict[tuple[str, str], set[str]] = {
     ("loss", "fluorescence_foreground"): {
         "enabled", "weight", "threshold_std_scale", "temperature", "mse_weight",
         "dice_weight", "intensity_weight", "min_activity_std",
+    },
+    ("loss", "competition_proxy"): {
+        "enabled", "weight", "start_ratio", "ssim_weight", "window_size",
+        "psnr_cap",
     },
 }
 
@@ -263,6 +294,13 @@ def validate_config(config: dict[str, Any]) -> None:
     workers = int(config["data"].get("num_workers", 0))
     if workers < 0:
         raise ConfigError("data.num_workers cannot be negative")
+    prefetch_factor = config["data"].get("prefetch_factor", 2)
+    if (
+        isinstance(prefetch_factor, bool)
+        or not isinstance(prefetch_factor, int)
+        or prefetch_factor < 1
+    ):
+        raise ConfigError("data.prefetch_factor must be a positive integer")
     grouped_folds = config["data"].get("grouped_inner_folds", {})
     if grouped_folds:
         if not isinstance(grouped_folds.get("enabled", False), bool):
@@ -307,6 +345,28 @@ def validate_config(config: dict[str, Any]) -> None:
             activity_sampler.get("activity_key", "")
         ).strip():
             raise ConfigError("data.activity_sampler.activity_key cannot be empty")
+        strategy = str(activity_sampler.get("strategy", "balanced")).casefold()
+        if strategy not in {"balanced", "hard_mix"}:
+            raise ConfigError(
+                "data.activity_sampler.strategy must be balanced or hard_mix"
+            )
+        try:
+            start_ratio = float(activity_sampler.get("start_ratio", 0.0))
+            hard_fraction = float(activity_sampler.get("hard_fraction", 0.0))
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                "data.activity_sampler start_ratio/hard_fraction must be numeric"
+            ) from error
+        if not 0.0 <= start_ratio < 1.0:
+            raise ConfigError("data.activity_sampler.start_ratio must lie in [0, 1)")
+        if not 0.0 <= hard_fraction < 1.0:
+            raise ConfigError("data.activity_sampler.hard_fraction must lie in [0, 1)")
+        if (
+            activity_sampler.get("enabled", False)
+            and strategy == "hard_mix"
+            and hard_fraction <= 0.0
+        ):
+            raise ConfigError("hard_mix activity sampling requires hard_fraction > 0")
     targets = config["data"].get("targets", [])
     if not isinstance(targets, list) or not targets:
         raise ConfigError("data.targets must be a non-empty list")
@@ -322,6 +382,11 @@ def validate_config(config: dict[str, Any]) -> None:
     val_ratio = float(config["data"].get("val_ratio", 0.0))
     if not 0.0 < val_ratio < 1.0:
         raise ConfigError("data.val_ratio must be in (0, 1)")
+    split_seed = config["data"].get(
+        "split_seed", config["project"].get("seed", 2026)
+    )
+    if isinstance(split_seed, bool) or not isinstance(split_seed, int) or split_seed < 0:
+        raise ConfigError("data.split_seed must be a nonnegative integer")
     for section, key in (("train", "epochs"), ("train", "gradient_accumulation")):
         value = config[section].get(key)
         if value != "auto" and int(value) < 1:
@@ -412,6 +477,17 @@ def validate_config(config: dict[str, Any]) -> None:
         or validate_every < 1
     ):
         raise ConfigError("train.validate_every_n_epochs must be a positive integer")
+    max_wall_time = config["train"].get("max_wall_time_hours", 0.0)
+    if isinstance(max_wall_time, bool):
+        raise ConfigError("train.max_wall_time_hours must be finite and nonnegative")
+    try:
+        max_wall_time_value = float(max_wall_time)
+    except (TypeError, ValueError) as error:
+        raise ConfigError(
+            "train.max_wall_time_hours must be finite and nonnegative"
+        ) from error
+    if not math.isfinite(max_wall_time_value) or max_wall_time_value < 0.0:
+        raise ConfigError("train.max_wall_time_hours must be finite and nonnegative")
     matmul_precision = str(
         config["train"].get("float32_matmul_precision", "highest")
     ).strip().casefold()
@@ -438,6 +514,69 @@ def validate_config(config: dict[str, Any]) -> None:
         if compile_mode not in {"default", "reduce-overhead", "max-autotune"}:
             raise ConfigError(
                 "train.compile.mode must be default, reduce-overhead, or max-autotune"
+            )
+    optimizer_options = config["train"].get("optimizer_options", {})
+    if optimizer_options:
+        if not isinstance(optimizer_options.get("enabled", False), bool):
+            raise ConfigError("train.optimizer_options.enabled must be boolean")
+        if not isinstance(
+            optimizer_options.get("no_decay_norm_bias", True), bool
+        ):
+            raise ConfigError(
+                "train.optimizer_options.no_decay_norm_bias must be boolean"
+            )
+        fused = optimizer_options.get("fused", "auto")
+        if not isinstance(fused, bool) and str(fused).casefold() != "auto":
+            raise ConfigError("train.optimizer_options.fused must be boolean or auto")
+    equivariance = config["train"].get("equivariance", {})
+    if equivariance:
+        if not isinstance(equivariance.get("enabled", False), bool):
+            raise ConfigError("train.equivariance.enabled must be boolean")
+        numeric_defaults = {
+            "probability": 0.0,
+            "weight": 0.0,
+            "start_ratio": 0.10,
+            "ramp_end_ratio": 0.40,
+            "smooth_l1_beta": 0.01,
+        }
+        try:
+            values = {
+                key: float(equivariance.get(key, default))
+                for key, default in numeric_defaults.items()
+            }
+        except (TypeError, ValueError) as error:
+            raise ConfigError("train.equivariance values must be numeric") from error
+        if any(not math.isfinite(value) for value in values.values()):
+            raise ConfigError("train.equivariance values must be finite")
+        if not 0.0 <= values["probability"] <= 1.0:
+            raise ConfigError("train.equivariance.probability must lie in [0, 1]")
+        if values["weight"] < 0.0:
+            raise ConfigError("train.equivariance.weight must be nonnegative")
+        if not 0.0 <= values["start_ratio"] < values["ramp_end_ratio"] <= 1.0:
+            raise ConfigError(
+                "train.equivariance requires 0 <= start_ratio < ramp_end_ratio <= 1"
+            )
+        if values["smooth_l1_beta"] <= 0.0:
+            raise ConfigError("train.equivariance.smooth_l1_beta must be positive")
+        if equivariance.get("enabled", False) and (
+            values["probability"] <= 0.0 or values["weight"] <= 0.0
+        ):
+            raise ConfigError(
+                "Enabled equivariance regularization requires positive probability and weight"
+            )
+    gpu_monitor = config["train"].get("gpu_monitor", {})
+    if gpu_monitor:
+        if not isinstance(gpu_monitor.get("enabled", False), bool):
+            raise ConfigError("train.gpu_monitor.enabled must be boolean")
+        try:
+            monitor_interval = float(gpu_monitor.get("interval_seconds", 2.0))
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                "train.gpu_monitor.interval_seconds must be numeric"
+            ) from error
+        if not math.isfinite(monitor_interval) or monitor_interval < 0.5:
+            raise ConfigError(
+                "train.gpu_monitor.interval_seconds must be finite and at least 0.5"
             )
     phase_a_ratio = float(config["loss"].get("phase_a_ratio", 0.7))
     if not 0.0 < phase_a_ratio < 1.0:
@@ -507,12 +646,86 @@ def validate_config(config: dict[str, Any]) -> None:
                     "Enabled fluorescence foreground loss requires a positive "
                     "internal loss weight"
                 )
+    initial_deep = config["loss"].get("deep_supervision_weights", [1.0, 0.5, 0.25])
+    final_deep = config["loss"].get("deep_supervision_final_weights")
+    if final_deep is not None:
+        if (
+            not isinstance(final_deep, list)
+            or not isinstance(initial_deep, list)
+            or len(final_deep) != len(initial_deep)
+            or not final_deep
+        ):
+            raise ConfigError(
+                "loss.deep_supervision_final_weights must be a non-empty list "
+                "matching loss.deep_supervision_weights"
+            )
+        try:
+            final_values = [float(value) for value in final_deep]
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                "loss.deep_supervision_final_weights must contain numeric values"
+            ) from error
+        if (
+            any(not math.isfinite(value) or value < 0.0 for value in final_values)
+            or final_values[0] <= 0.0
+        ):
+            raise ConfigError(
+                "Final deep-supervision weights must be finite/nonnegative and "
+                "retain a positive full-resolution weight"
+            )
+    competition_proxy = config["loss"].get("competition_proxy", {})
+    if competition_proxy:
+        enabled = competition_proxy.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ConfigError("loss.competition_proxy.enabled must be boolean")
+        numeric_defaults = {
+            "weight": 0.0,
+            "start_ratio": 0.55,
+            "ssim_weight": 0.7,
+            "window_size": 7,
+            "psnr_cap": 60.0,
+        }
+        try:
+            proxy_values = {
+                key: float(competition_proxy.get(key, default))
+                for key, default in numeric_defaults.items()
+            }
+        except (TypeError, ValueError) as error:
+            raise ConfigError("loss.competition_proxy values must be numeric") from error
+        if any(not math.isfinite(value) for value in proxy_values.values()):
+            raise ConfigError("loss.competition_proxy values must be finite")
+        if enabled and proxy_values["weight"] <= 0.0:
+            raise ConfigError("Enabled competition proxy requires a positive weight")
+        if not 0.0 <= proxy_values["start_ratio"] < 1.0:
+            raise ConfigError("loss.competition_proxy.start_ratio must lie in [0, 1)")
+        if not 0.0 <= proxy_values["ssim_weight"] <= 1.0:
+            raise ConfigError("loss.competition_proxy.ssim_weight must lie in [0, 1]")
+        window_size = competition_proxy.get("window_size", 7)
+        if (
+            isinstance(window_size, bool)
+            or not isinstance(window_size, int)
+            or window_size < 3
+            or window_size % 2 == 0
+        ):
+            raise ConfigError(
+                "loss.competition_proxy.window_size must be an odd integer >= 3"
+            )
+        if proxy_values["psnr_cap"] <= 0.0:
+            raise ConfigError("loss.competition_proxy.psnr_cap must be positive")
     channels_last_cfg = config["train"].get("channels_last", False)
     if not isinstance(channels_last_cfg, bool):
         raise ConfigError("train.channels_last must be boolean")
     cudnn_benchmark_cfg = config["train"].get("cudnn_benchmark", None)
     if cudnn_benchmark_cfg is not None and not isinstance(cudnn_benchmark_cfg, bool):
         raise ConfigError("train.cudnn_benchmark must be boolean or null")
+    base_detail = config["model"].get("base_detail", False)
+    base_detail_residual = config["model"].get("base_detail_residual", False)
+    if not isinstance(base_detail, bool):
+        raise ConfigError("model.base_detail must be boolean")
+    if not isinstance(base_detail_residual, bool):
+        raise ConfigError("model.base_detail_residual must be boolean")
+    if base_detail_residual and not base_detail:
+        raise ConfigError("model.base_detail_residual requires model.base_detail=true")
     context = config["model"].get("context", {})
     if context:
         grid_size = int(context.get("grid_size", 3))
@@ -530,6 +743,120 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ConfigError(
                     "Verified context cannot use image-edge graph coordinate inference"
                 )
+    spatial_frequency = config["model"].get("spatial_frequency", {})
+    if spatial_frequency:
+        if not isinstance(spatial_frequency.get("enabled", False), bool):
+            raise ConfigError("model.spatial_frequency.enabled must be boolean")
+        for key, default in (
+            ("spatial_depth", 1),
+            ("spatial_expansion", 1),
+            ("gate_reduction", 8),
+        ):
+            value = spatial_frequency.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ConfigError(
+                    f"model.spatial_frequency.{key} must be a positive integer"
+                )
+        try:
+            frequency_cutoff = float(
+                spatial_frequency.get("frequency_cutoff", 0.35)
+            )
+            transition_width = float(
+                spatial_frequency.get("frequency_transition_width", 0.08)
+            )
+            residual_init = float(spatial_frequency.get("residual_init", 0.0))
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                "model.spatial_frequency floating-point options must be numeric"
+            ) from error
+        if not all(
+            math.isfinite(value)
+            for value in (frequency_cutoff, transition_width, residual_init)
+        ):
+            raise ConfigError(
+                "model.spatial_frequency floating-point options must be finite"
+            )
+        if not 0.0 < frequency_cutoff < 1.0:
+            raise ConfigError(
+                "model.spatial_frequency.frequency_cutoff must lie in (0, 1)"
+            )
+        if transition_width <= 0.0:
+            raise ConfigError(
+                "model.spatial_frequency.frequency_transition_width must be positive"
+            )
+    lightweight_unet = config["model"].get("lightweight_unet", {})
+    if lightweight_unet:
+        if not isinstance(lightweight_unet.get("enabled", False), bool):
+            raise ConfigError("model.lightweight_unet.enabled must be boolean")
+        for key, default in (
+            ("widths", [16, 24, 32, 48]),
+            ("depths", [1, 1, 1, 1]),
+        ):
+            values = lightweight_unet.get(key, default)
+            if (
+                not isinstance(values, list)
+                or len(values) != 4
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 1
+                    for value in values
+                )
+            ):
+                raise ConfigError(
+                    f"model.lightweight_unet.{key} must contain four positive integers"
+                )
+        kernel_size = lightweight_unet.get("kernel_size", 7)
+        if (
+            isinstance(kernel_size, bool)
+            or not isinstance(kernel_size, int)
+            or kernel_size < 3
+            or kernel_size % 2 == 0
+        ):
+            raise ConfigError(
+                "model.lightweight_unet.kernel_size must be an odd integer >= 3"
+            )
+        expansion = lightweight_unet.get("expansion", 2)
+        if (
+            isinstance(expansion, bool)
+            or not isinstance(expansion, int)
+            or expansion < 1
+        ):
+            raise ConfigError(
+                "model.lightweight_unet.expansion must be a positive integer"
+            )
+        fusion_scales = lightweight_unet.get("fusion_scales", [1, 2, 4])
+        if (
+            not isinstance(fusion_scales, list)
+            or not fusion_scales
+            or any(
+                isinstance(scale, bool)
+                or not isinstance(scale, int)
+                or scale not in {1, 2, 4}
+                for scale in fusion_scales
+            )
+            or len(set(fusion_scales)) != len(fusion_scales)
+        ):
+            raise ConfigError(
+                "model.lightweight_unet.fusion_scales must be unique values from 1/2/4"
+            )
+        try:
+            lightweight_residual_init = float(
+                lightweight_unet.get("residual_init", 0.0)
+            )
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                "model.lightweight_unet.residual_init must be numeric"
+            ) from error
+        if not math.isfinite(lightweight_residual_init):
+            raise ConfigError(
+                "model.lightweight_unet.residual_init must be finite"
+            )
+        if lightweight_residual_init != 0.0:
+            raise ConfigError(
+                "model.lightweight_unet.residual_init must be zero so enabling "
+                "the branch preserves the pretrained/local backbone initially"
+            )
     prototypes = config["model"].get("prototypes", {})
     if prototypes:
         reset_enabled = prototypes.get("reset_dead", False)

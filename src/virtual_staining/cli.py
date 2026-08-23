@@ -200,7 +200,9 @@ def _ensure_manifests(
     return build_manifests(
         root,
         workspace=Path.cwd(),
-        seed=int(config["project"].get("seed", 2026)),
+        seed=int(
+            data.get("split_seed", config["project"].get("seed", 2026))
+        ),
         val_fraction=float(data.get("val_ratio", 0.2)),
         surrogate_block_size=int(data.get("surrogate_group_size", 32)),
         smoke_count=int(data.get("smoke_count", 8)),
@@ -353,6 +355,14 @@ def _build_loss(config: Mapping[str, Any]) -> nn.Module:
                     "deep_supervision_weights", (1.0, 0.5, 0.25)
                 )
             ),
+            deep_supervision_final_weights=(
+                tuple(
+                    float(value)
+                    for value in loss_config["deep_supervision_final_weights"]
+                )
+                if loss_config.get("deep_supervision_final_weights") is not None
+                else None
+            ),
             frequency=float(loss_config.get("frequency", 0.0)),
             correlation=float(loss_config.get("correlation", 0.0)),
             prototype_activation=float(
@@ -393,6 +403,25 @@ def _build_loss(config: Mapping[str, Any]) -> nn.Module:
             ),
             foreground_min_activity_std=float(
                 foreground.get("min_activity_std", 0.01)
+            ),
+            competition_proxy_enabled=bool(
+                isinstance(loss_config.get("competition_proxy", {}), Mapping)
+                and loss_config.get("competition_proxy", {}).get("enabled", False)
+            ),
+            competition_proxy_weight=float(
+                loss_config.get("competition_proxy", {}).get("weight", 0.0)
+            ),
+            competition_proxy_start_ratio=float(
+                loss_config.get("competition_proxy", {}).get("start_ratio", 0.55)
+            ),
+            competition_proxy_ssim_weight=float(
+                loss_config.get("competition_proxy", {}).get("ssim_weight", 0.7)
+            ),
+            competition_proxy_window_size=int(
+                loss_config.get("competition_proxy", {}).get("window_size", 7)
+            ),
+            competition_proxy_psnr_cap=float(
+                loss_config.get("competition_proxy", {}).get("psnr_cap", 60.0)
             ),
             data_range=float(loss_config.get("data_range", 1.0)),
         )
@@ -455,11 +484,48 @@ def _make_loader(
         transform = None
         if train:
             augmentation = config.get("augmentation", {})
-            transform = (
-                ContextPairedTransform()
-                if context_enabled
-                else PairedTransform(max_translation=int(augmentation.get("max_translation", 0)))
-            )
+            shared_transform_options = {
+                "horizontal_flip_probability": float(
+                    augmentation.get("horizontal_flip_probability", 0.5)
+                ),
+                "vertical_flip_probability": float(
+                    augmentation.get("vertical_flip_probability", 0.5)
+                ),
+                "rotate_probability": float(
+                    augmentation.get("rotate_probability", 1.0)
+                ),
+                "gamma_range": tuple(
+                    float(value)
+                    for value in augmentation.get("gamma_range", (0.9, 1.1))
+                ),
+                "gamma_probability": float(
+                    augmentation.get("gamma_probability", 0.5)
+                ),
+                "brightness_delta": float(
+                    augmentation.get("brightness_delta", 0.05)
+                ),
+                "brightness_probability": float(
+                    augmentation.get("brightness_probability", 0.5)
+                ),
+                "contrast_range": tuple(
+                    float(value)
+                    for value in augmentation.get("contrast_range", (0.95, 1.05))
+                ),
+                "contrast_probability": float(
+                    augmentation.get("contrast_probability", 0.5)
+                ),
+                "noise_std": float(augmentation.get("noise_std", 0.005)),
+                "noise_probability": float(
+                    augmentation.get("noise_probability", 0.25)
+                ),
+            }
+            if context_enabled:
+                transform = ContextPairedTransform(**shared_transform_options)
+            else:
+                transform = PairedTransform(
+                    **shared_transform_options,
+                    max_translation=int(augmentation.get("max_translation", 0)),
+                )
         if context_enabled:
             dataset = NeighborhoodDataset(
                 rows,
@@ -503,6 +569,7 @@ def _make_loader(
     workers = int(data.get("num_workers", 0))
     persistent = bool(data.get("persistent_workers", False)) and workers > 0
     pin = bool(data.get("pin_memory", False)) and torch.cuda.is_available()
+    prefetch_factor = int(data.get("prefetch_factor", 2)) if workers > 0 else None
     sampler_options = (
         activity_plan.dataloader_kwargs()
         if train and activity_plan is not None
@@ -514,6 +581,7 @@ def _make_loader(
         num_workers=workers,
         pin_memory=pin,
         persistent_workers=persistent,
+        prefetch_factor=prefetch_factor,
         worker_init_fn=seed_worker if workers else None,
         generator=generator,
         **sampler_options,
@@ -549,6 +617,9 @@ def _expected_target_mode(target: str, image_specs: Any = None) -> str | None:
 
 
 def _scheduler(optimizer: torch.optim.Optimizer, config: Mapping[str, Any]) -> Any:
+    scheduler_name = str(config["train"].get("scheduler", "cosine")).casefold()
+    if scheduler_name in {"none", "constant"}:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
     epochs = int(config["train"].get("epochs", 1))
     warmup = int(config["train"].get("warmup_epochs", 0))
 
@@ -639,6 +710,20 @@ def _prepare_training(
         num_samples=activity_options.get("num_samples")
         if isinstance(activity_options, Mapping)
         else None,
+        strategy=str(activity_options.get("strategy", "balanced"))
+        if isinstance(activity_options, Mapping)
+        else "balanced",
+        start_epoch=int(
+            math.ceil(
+                float(activity_options.get("start_ratio", 0.0))
+                * int(config["train"].get("epochs", 1))
+            )
+        )
+        if isinstance(activity_options, Mapping)
+        else 0,
+        hard_fraction=float(activity_options.get("hard_fraction", 0.0))
+        if isinstance(activity_options, Mapping)
+        else 0.0,
     )
     resolved_train_manifest = _write_rows_csv(
         run_dir / "manifests" / "train_manifest.csv", train_rows
@@ -662,12 +747,20 @@ def _prepare_training(
         stage_controller.transition(str(stage))
         stage_controller.configure_trainable_parameters(model)
     loss_fn = _build_loss(config)
-    optimizer = torch.optim.AdamW(
-        collect_optimizer_parameters(model, loss_fn),
-        lr=float(config["train"].get("lr", 2e-4)),
-        weight_decay=float(config["train"].get("weight_decay", 1e-4)),
+    optimizer_options = config["train"].get("optimizer_options", {})
+    optimized_adamw = bool(
+        isinstance(optimizer_options, Mapping)
+        and optimizer_options.get("enabled", False)
     )
-    scheduler = _scheduler(optimizer, config)
+    optimizer = None
+    scheduler = None
+    if not optimized_adamw:
+        optimizer = torch.optim.AdamW(
+            collect_optimizer_parameters(model, loss_fn),
+            lr=float(config["train"].get("lr", 2e-4)),
+            weight_decay=float(config["train"].get("weight_decay", 1e-4)),
+        )
+        scheduler = _scheduler(optimizer, config)
     trainer = Trainer(
         model,
         train_loader,
@@ -1855,6 +1948,86 @@ def command_autodl_submit(args: argparse.Namespace) -> dict[str, Any]:
         report["zip_path"],
         checkpoint,
     )
+    return report
+
+
+def command_autodl_ensemble_submit(args: argparse.Namespace) -> dict[str, Any]:
+    """Average independent checkpoints with D4 and build one validated ZIP."""
+
+    if len(args.checkpoints) < 2:
+        raise ValueError("autodl-ensemble-submit requires at least two checkpoints")
+    effective_overrides = _autodl_overrides(args.set)
+    discovery = discover_data_root(
+        args.data_root,
+        workspace=Path.cwd(),
+        config_path=args.config,
+        output_path="artifacts/data_discovery.json",
+    )
+    base_config = load_config(args.config, effective_overrides, include_resolved=False)
+    submit_targets = _submission_targets(base_config)
+    if len(submit_targets) != 1:
+        raise ValueError(
+            "autodl-ensemble-submit requires exactly one submit target "
+            f"(got {submit_targets})"
+        )
+    target = normalize_marker(args.target) if args.target else submit_targets[0]
+    if target not in submit_targets:
+        raise ValueError(
+            f"Requested target {target!r} is not in submit_targets {submit_targets}"
+        )
+    manifests = _ensure_manifests(discovery, base_config)
+    output_root = Path(args.output_dir).expanduser().resolve()
+    if output_root.exists() and any(output_root.iterdir()):
+        raise FileExistsError(
+            f"Ensemble output directory is not empty: {output_root}. "
+            "Choose a new --output-dir to prevent stale predictions entering the ZIP."
+        )
+    prediction_dir = output_root / "predictions"
+    ensemble_result = command_ensemble(
+        argparse.Namespace(
+            config=args.config,
+            set=effective_overrides,
+            target=target,
+            max_epochs=None,
+            data_root=str(discovery.selected_root),
+            checkpoints=args.checkpoints,
+            weights=args.weights,
+            validation_scores=args.validation_scores,
+            weight_temperature=args.weight_temperature,
+            manifest=str(manifests.test_manifest),
+            output_dir=str(prediction_dir),
+        )
+    )
+    submission_root = output_root / "submission"
+    submission = command_make_submission(
+        argparse.Namespace(
+            config=args.config,
+            set=effective_overrides,
+            target=target,
+            max_epochs=None,
+            pred_dir=str(prediction_dir),
+            test_manifest=str(manifests.test_manifest),
+            output_dir=str(submission_root),
+            submit_target=True,
+        )
+    )
+    validation = validate_submission(
+        submission_root / "results",
+        manifests.test_manifest,
+        target,
+        zip_path=submission["zip_path"],
+        artifact_dir=output_root / "artifacts",
+        expected_mode=_expected_target_mode(target),
+    )
+    report = {
+        "command": "autodl-ensemble-submit",
+        "checkpoints": [str(Path(path).expanduser().resolve()) for path in args.checkpoints],
+        "ensemble": ensemble_result,
+        "submission": submission,
+        "submission_validation": validation,
+        "zip_path": submission["zip_path"],
+    }
+    _write_json(output_root / "ensemble_submission_report.json", report)
     return report
 
 
@@ -3489,6 +3662,26 @@ def build_parser() -> argparse.ArgumentParser:
     autodl_submit.set_defaults(
         handler=command_autodl_submit,
         config="configs/initial_round_cd68_retrain_v2.yaml",
+    )
+
+    autodl_ensemble_submit = subparsers.add_parser(
+        "autodl-ensemble-submit",
+        help="D4-average multiple checkpoints and build one validated official ZIP",
+    )
+    _add_config_arguments(autodl_ensemble_submit, target=True)
+    autodl_ensemble_submit.add_argument("--checkpoints", nargs="+", required=True)
+    autodl_ensemble_submit.add_argument("--weights", nargs="+", type=float, default=None)
+    autodl_ensemble_submit.add_argument(
+        "--validation-scores", nargs="+", type=float, default=None
+    )
+    autodl_ensemble_submit.add_argument("--weight-temperature", type=float, default=0.02)
+    autodl_ensemble_submit.add_argument(
+        "--output-dir",
+        default="outputs/initial_round_max_v3/ensemble_seed2026_seed3407",
+    )
+    autodl_ensemble_submit.set_defaults(
+        handler=command_autodl_ensemble_submit,
+        config="configs/initial_round_cd68_max_v3.yaml",
     )
 
     benchmark = subparsers.add_parser(

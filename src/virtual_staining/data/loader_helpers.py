@@ -231,6 +231,9 @@ def prepare_activity_sampling(
     num_bins: int = 4,
     seed: int = 2026,
     num_samples: int | None = None,
+    strategy: str = "balanced",
+    start_epoch: int = 0,
+    hard_fraction: float = 0.0,
 ) -> ActivitySamplingPlan:
     """Create a train-only sampler from precomputed manifest scalar values."""
 
@@ -248,5 +251,8 @@ def prepare_activity_sampling(
         num_bins=num_bins,
         seed=seed,
         num_samples=num_samples,
+        strategy=strategy,
+        start_epoch=start_epoch,
+        hard_fraction=hard_fraction,
     )
     return ActivitySamplingPlan(source_indices=resolved_indices, sampler=sampler)

@@ -17,6 +17,20 @@ from .roi_index import ROIGridAudit, ROIIndex
 ContextTransform = Callable[..., Mapping[str, Any]]
 
 
+def _collatable_coordinate(index: ROIIndex, row_index: int) -> dict[str, Any]:
+    """Serialize a coordinate into primitives accepted by DataLoader collate."""
+
+    coordinate = index.coordinate_for(row_index)
+    if coordinate is None:
+        return {"available": False, "roi_id": "", "row": -1, "col": -1}
+    return {
+        "available": True,
+        "roi_id": coordinate.roi_id,
+        "row": coordinate.row,
+        "col": coordinate.col,
+    }
+
+
 def context_offsets(grid_size: int = 3) -> torch.Tensor:
     """Return canonical row-major ``(row, col)`` offsets for an odd grid."""
 
@@ -223,7 +237,7 @@ class NeighborhoodDataset(_RawDAPITensorLRU, VirtualStainingDataset):
                     "canonical_key": str(item["canonical_key"]),
                     "organ": str(item["organ"]),
                     "split": str(item["split"]),
-                    "coordinate": self.roi_index.coordinate_for(index),
+                    "coordinate": _collatable_coordinate(self.roi_index, index),
                 },
             }
         )

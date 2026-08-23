@@ -2,6 +2,32 @@
 
 > 本文档是 AutoDL 上运行本项目的推荐入口。旧 checkpoint 已遗失时，按顺序执行下面两条命令即可重新训练、验证并生成竞赛提交包。
 
+> **2026-08 性能升级：** 本文下面的 v2 命令仍是可回退的稳定对照。RTX
+> 4090 上的新 feature-flagged v3 候选（NAF + 轻量 Detail U + 空间/FFT +
+> 真实 ROI context）、GPU 利用率日志、9 小时时间保护和 D4 提交命令请看
+> [RTX 4090 性能升级指南](PERFORMANCE_4090_V3.md)。v3 尚未在本机完成正式
+> 训练，不能预先声称涨分。
+
+如果你这次要重新训练刚加入轻量 U-Net、空间/频率和真实 ROI context 的版本，
+直接使用下面这一条；后文的 v2 命令只作为稳定回退对照：
+
+```bash
+cd /root/autodl-tmp/project
+conda activate MEDICAL
+export PYTHONPATH="$PWD/src:$PYTHONPATH"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+python -m virtual_staining.cli --log-root log autodl-run \
+  --config configs/initial_round_cd68_max_v3.yaml \
+  --data-root AUTO \
+  --target CD68 \
+  --run-id cd68_max_v3_seed2026
+```
+
+该命令已经包含训练、raw/EMA 验证、最终 D4 验证和日志，不需要再手动拼接
+训练脚本。完整的性能判断、GPU 日志和提交命令见上面的 v3 指南。
+
 ## 前置准备（仅首次）
 
 ```bash

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .charbonnier import CharbonnierLoss, float32_context
+from .competition_proxy import CompetitionProxyLoss
 from .composite import (
     LossOutput,
     _align_targets,
@@ -157,6 +158,7 @@ class ScheduledCompositeLoss(nn.Module):
         statistics_pooled_weight: float = 0.0,
         task_balancer: nn.Module | None = None,
         deep_supervision_weights: Sequence[float] = (1.0, 0.5, 0.25),
+        deep_supervision_final_weights: Sequence[float] | None = None,
         frequency: float = 0.0,
         correlation: float = 0.0,
         prototype_activation: float = 0.0,
@@ -175,6 +177,12 @@ class ScheduledCompositeLoss(nn.Module):
         foreground_dice_weight: float = 0.10,
         foreground_intensity_weight: float = 0.25,
         foreground_min_activity_std: float = 0.01,
+        competition_proxy_enabled: bool = False,
+        competition_proxy_weight: float = 0.0,
+        competition_proxy_start_ratio: float = 0.55,
+        competition_proxy_ssim_weight: float = 0.7,
+        competition_proxy_window_size: int = 7,
+        competition_proxy_psnr_cap: float = 60.0,
         data_range: float = 1.0,
     ) -> None:
         super().__init__()
@@ -183,6 +191,29 @@ class ScheduledCompositeLoss(nn.Module):
             for weight in deep_supervision_weights
         ):
             raise ValueError("Deep supervision weights must be finite and positive")
+        final_deep_weights = (
+            tuple(float(weight) for weight in deep_supervision_final_weights)
+            if deep_supervision_final_weights is not None
+            else tuple(float(weight) for weight in deep_supervision_weights)
+        )
+        if (
+            len(final_deep_weights) != len(deep_supervision_weights)
+            or any(not math.isfinite(weight) or weight < 0.0 for weight in final_deep_weights)
+            or final_deep_weights[0] <= 0.0
+        ):
+            raise ValueError(
+                "Final deep supervision weights must match the initial length, "
+                "be finite/nonnegative, and retain a positive full-resolution weight"
+            )
+        if (
+            not math.isfinite(float(competition_proxy_weight))
+            or float(competition_proxy_weight) < 0.0
+        ):
+            raise ValueError("Competition proxy weight must be finite and nonnegative")
+        if not 0.0 <= float(competition_proxy_start_ratio) < 1.0:
+            raise ValueError("Competition proxy start_ratio must lie in [0, 1)")
+        if competition_proxy_enabled and float(competition_proxy_weight) <= 0.0:
+            raise ValueError("Enabled competition proxy requires a positive weight")
         auxiliary_weights = {
             "frequency": float(frequency),
             "correlation": float(correlation),
@@ -219,6 +250,7 @@ class ScheduledCompositeLoss(nn.Module):
         self.deep_supervision_weights = tuple(
             float(weight) for weight in deep_supervision_weights
         )
+        self.deep_supervision_final_weights = final_deep_weights
         self.auxiliary_weights = auxiliary_weights
         self.charbonnier_loss = CharbonnierLoss()
         self.ssim_loss = SSIMLoss(data_range=data_range)
@@ -249,6 +281,20 @@ class ScheduledCompositeLoss(nn.Module):
                 min_activity_std=foreground_min_activity_std,
             )
             if foreground_enabled and foreground_weight > 0.0
+            else None
+        )
+        self.competition_proxy_weight = (
+            float(competition_proxy_weight) if competition_proxy_enabled else 0.0
+        )
+        self.competition_proxy_start_ratio = float(competition_proxy_start_ratio)
+        self.competition_proxy_loss = (
+            CompetitionProxyLoss(
+                ssim_weight=float(competition_proxy_ssim_weight),
+                data_range=data_range,
+                window_size=int(competition_proxy_window_size),
+                psnr_cap=float(competition_proxy_psnr_cap),
+            )
+            if competition_proxy_enabled
             else None
         )
         self.task_balancer = task_balancer
@@ -325,11 +371,38 @@ class ScheduledCompositeLoss(nn.Module):
                 for name, factory in factories.items()
             }
 
+    def _late_fraction(self, start_ratio: float) -> float:
+        if self.force_phase_b:
+            return 1.0
+        if self.progress <= start_ratio:
+            return 0.0
+        position = (self.progress - start_ratio) / (1.0 - start_ratio)
+        return 0.5 - 0.5 * math.cos(math.pi * min(1.0, max(0.0, position)))
+
+    def current_deep_supervision_weights(self) -> tuple[float, ...]:
+        fraction = self.schedule.transition_fraction(self.progress)
+        if self.force_phase_b:
+            fraction = 1.0
+        return tuple(
+            initial + fraction * (final - initial)
+            for initial, final in zip(
+                self.deep_supervision_weights,
+                self.deep_supervision_final_weights,
+                strict=True,
+            )
+        )
+
     def _deep_supervision_weight(self, index: int) -> float:
-        if index < len(self.deep_supervision_weights):
-            return self.deep_supervision_weights[index]
-        return self.deep_supervision_weights[-1] * 0.5 ** (
-            index - len(self.deep_supervision_weights) + 1
+        weights = self.current_deep_supervision_weights()
+        if index < len(weights):
+            return weights[index]
+        return weights[-1] * 0.5 ** (
+            index - len(weights) + 1
+        )
+
+    def current_competition_proxy_weight(self) -> float:
+        return self.competition_proxy_weight * self._late_fraction(
+            self.competition_proxy_start_ratio
         )
 
     @staticmethod
@@ -486,11 +559,31 @@ class ScheduledCompositeLoss(nn.Module):
         for name, value in auxiliary_values.items():
             components[name] = value
             auxiliary_total = auxiliary_total + self.auxiliary_weights[name] * value
-        total = reconstruction_total + auxiliary_total
+        proxy_weight = self.current_competition_proxy_weight()
+        proxy_values: list[Tensor] = []
+        if self.competition_proxy_loss is not None and proxy_weight > 0.0:
+            for task, prediction in predictions.items():
+                target = self._aligned_full_target(prediction, aligned[task])
+                proxy = self.competition_proxy_loss(prediction, target)
+                proxy_values.append(proxy.total)
+                components[f"{task}/competition_proxy/ssim_loss"] = proxy.ssim_loss
+                components[f"{task}/competition_proxy/psnr_loss"] = proxy.psnr_loss
+                components[f"{task}/competition_proxy/mean_ssim"] = proxy.mean_ssim
+                components[f"{task}/competition_proxy/mean_psnr"] = proxy.mean_psnr
+        competition_proxy_value = (
+            torch.stack(proxy_values).mean() if proxy_values else zero
+        )
+        competition_proxy_total = proxy_weight * competition_proxy_value
+        total = reconstruction_total + auxiliary_total + competition_proxy_total
         components["reconstruction_total"] = reconstruction_total
         components["auxiliary_total"] = auxiliary_total
+        components["competition_proxy"] = competition_proxy_value
+        components["competition_proxy_total"] = competition_proxy_total
+        components["schedule/competition_proxy_weight"] = total.new_tensor(proxy_weight)
         components["schedule/progress"] = total.new_tensor(self.progress)
         for name, value in weight_values.items():
             components[f"schedule/{name}"] = total.new_tensor(value)
+        for index, value in enumerate(self.current_deep_supervision_weights()):
+            components[f"schedule/deep_supervision_{index}"] = total.new_tensor(value)
         components["total"] = total
         return LossOutput(total=total, components=components, per_task=per_task)

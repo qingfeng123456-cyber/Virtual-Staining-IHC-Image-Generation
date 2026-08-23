@@ -10,7 +10,7 @@
 - artifacts/ 中的 manifest、审计和环境报告由运行命令自动重新生成，不随 GitHub 仓库上传；
 - 真实训练产生的 outputs/、checkpoint 和提交结果默认被 .gitignore 排除。
 
-你不需要修改 Python 源码。checkpoint 遗失后的推荐重训配置是 `configs/initial_round_cd68_retrain_v2.yaml`；`configs/initial_round_cd68.yaml` 仅保留为上一轮基线复现配置。完整命令见第 9、10 和 16 节。使用 AutoDL 训练、查看进度和下载可复盘日志，请直接阅读 [AutoDL 保姆级指南](docs/AUTODL_RUN.md)。
+你不需要修改 Python 源码。`configs/initial_round_cd68_retrain_v2.yaml` 是已跑过的稳定对照；面向 RTX 4090、9 小时上限的新性能候选是 `configs/initial_round_cd68_max_v3.yaml`。它在原 NAF U 形主干上同时启用轻量 Detail U 分支、空间—频率并行瓶颈、真实 3×3 ROI context、prototype、base/detail、浮点指标代理损失和 D4 等变训练，合计约 18.07M 参数/44.11 GMAC。v3 在完整训练前不能声称涨分，必须与固定 D4 JPG 基线 `0.809280 / 26.19677` 同协议比较。日常流程见 [AutoDL 保姆级指南](docs/AUTODL_RUN.md)，新候选和完整命令见 [4090 性能升级指南](docs/PERFORMANCE_4090_V3.md)。
 
 ## 当前初赛数据审计结论
 

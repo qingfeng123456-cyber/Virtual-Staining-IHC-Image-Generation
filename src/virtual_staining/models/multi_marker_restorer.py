@@ -13,9 +13,11 @@ from .context_fusion import (
 )
 from .context_tile_encoder import SharedTinyContextEncoder
 from .laplacian_decoder import LaplacianBaseDetailHead
+from .lightweight_detail_unet import LightweightDetailUNet
 from .naf_blocks import DecoderStage, NAFStage, SobelMagnitude, TaskAdapter
 from .prototype_mixer import MultiTaskPrototypeMixer
 from .registry import RestorationOutput, register_model
+from .spatial_frequency_mixer import ParallelSpatialFrequencyMixer
 
 
 def _normalized_task_name(value: str) -> str:
@@ -52,8 +54,11 @@ class MultiMarkerRestorer(nn.Module):
         decoder_mode: str = "shared_decoder_with_adapters",
         output_activation: str = "sigmoid",
         base_detail: bool = False,
+        base_detail_residual: bool = False,
         max_detail_amplitude: float = 1.0,
         context: Mapping[str, object] | None = None,
+        spatial_frequency: Mapping[str, object] | None = None,
+        lightweight_unet: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         if in_channels < 1 or base_channels < 1:
@@ -92,12 +97,27 @@ class MultiMarkerRestorer(nn.Module):
         self.deep_supervision_enabled = bool(deep_supervision)
         self.decoder_mode = decoder_mode
         self.base_detail_enabled = bool(base_detail)
+        self.base_detail_residual_enabled = bool(base_detail_residual)
+        if self.base_detail_residual_enabled and not self.base_detail_enabled:
+            raise ValueError("base_detail_residual requires base_detail=True")
         if max_detail_amplitude < 0.0:
             raise ValueError("max_detail_amplitude cannot be negative")
         if context is not None and not isinstance(context, Mapping):
             raise TypeError("context must be a mapping or None")
+        if spatial_frequency is not None and not isinstance(spatial_frequency, Mapping):
+            raise TypeError("spatial_frequency must be a mapping or None")
+        if lightweight_unet is not None and not isinstance(lightweight_unet, Mapping):
+            raise TypeError("lightweight_unet must be a mapping or None")
         context_options = dict(context or {})
+        spatial_frequency_options = dict(spatial_frequency or {})
+        lightweight_unet_options = dict(lightweight_unet or {})
         self.context_enabled = bool(context_options.get("enabled", False))
+        self.spatial_frequency_enabled = bool(
+            spatial_frequency_options.get("enabled", False)
+        )
+        self.lightweight_unet_enabled = bool(
+            lightweight_unet_options.get("enabled", False)
+        )
         cross_attention_requested = bool(
             context_options.get("bottleneck_cross_attention", False)
         )
@@ -107,8 +127,11 @@ class MultiMarkerRestorer(nn.Module):
             )
         self.feature_flags = {
             "base_detail": self.base_detail_enabled,
+            "base_detail_residual": self.base_detail_residual_enabled,
             "context": self.context_enabled,
             "context_cross_attention": cross_attention_requested,
+            "spatial_frequency": self.spatial_frequency_enabled,
+            "lightweight_unet": self.lightweight_unet_enabled,
         }
         self._task_keys = {task: f"task_{index}" for index, task in enumerate(self.target_names)}
         self._normalized_tasks = {
@@ -126,6 +149,38 @@ class MultiMarkerRestorer(nn.Module):
         self.downsamples = nn.ModuleList(
             nn.Conv2d(channels[index], channels[index + 1], kernel_size=2, stride=2)
             for index in range(3)
+        )
+
+        self.lightweight_detail_unet = (
+            LightweightDetailUNet(
+                stem_channels,
+                channels[:3],
+                widths=tuple(
+                    int(width)
+                    for width in lightweight_unet_options.get(
+                        "widths", (16, 24, 32, 48)
+                    )
+                ),
+                depths=tuple(
+                    int(depth)
+                    for depth in lightweight_unet_options.get(
+                        "depths", (1, 1, 1, 1)
+                    )
+                ),
+                kernel_size=int(lightweight_unet_options.get("kernel_size", 7)),
+                expansion=int(lightweight_unet_options.get("expansion", 2)),
+                fusion_scales=tuple(
+                    int(scale)
+                    for scale in lightweight_unet_options.get(
+                        "fusion_scales", (1, 2, 4)
+                    )
+                ),
+                residual_init=float(
+                    lightweight_unet_options.get("residual_init", 0.0)
+                ),
+            )
+            if self.lightweight_unet_enabled
+            else None
         )
 
         if self.context_enabled:
@@ -177,6 +232,30 @@ class MultiMarkerRestorer(nn.Module):
             self.context_encoder = None
             self.context_fusion = None
             self.context_cross_attention = None
+
+        self.spatial_frequency_mixer = (
+            ParallelSpatialFrequencyMixer(
+                channels[-1],
+                spatial_depth=int(spatial_frequency_options.get("spatial_depth", 1)),
+                spatial_expansion=int(
+                    spatial_frequency_options.get("spatial_expansion", 1)
+                ),
+                gate_reduction=int(
+                    spatial_frequency_options.get("gate_reduction", 8)
+                ),
+                frequency_cutoff=float(
+                    spatial_frequency_options.get("frequency_cutoff", 0.35)
+                ),
+                frequency_transition_width=float(
+                    spatial_frequency_options.get("frequency_transition_width", 0.08)
+                ),
+                residual_init=float(
+                    spatial_frequency_options.get("residual_init", 0.0)
+                ),
+            )
+            if self.spatial_frequency_enabled
+            else None
+        )
 
         self.prototype_mixer = (
             MultiTaskPrototypeMixer(
@@ -241,6 +320,7 @@ class MultiMarkerRestorer(nn.Module):
                         full_channels=channels[0],
                         out_channels=output_channels[task],
                         max_detail_amplitude=max_detail_amplitude,
+                        residual_to_reference=self.base_detail_residual_enabled,
                     )
                     for task in self.target_names
                 }
@@ -305,13 +385,16 @@ class MultiMarkerRestorer(nn.Module):
         embedding = self.task_embeddings(task_ids)
         features = bottleneck
         predictions: list[Tensor] = []
+        prediction_logits: list[Tensor] = []
         decoded_features: list[Tensor] = []
         for index, (stage, skip) in enumerate(zip(stages, skips, strict=True)):
             features = stage(features, skip)
             if self.use_task_adapters:
                 features = self.adapters[task_key][index](features, embedding)
             decoded_features.append(features)
-            predictions.append(torch.sigmoid(self.output_heads[task_key][index](features)))
+            stage_logits = self.output_heads[task_key][index](features)
+            prediction_logits.append(stage_logits)
+            predictions.append(torch.sigmoid(stage_logits))
 
         base_prediction: Tensor | None = None
         detail_prediction: Tensor | None = None
@@ -320,6 +403,11 @@ class MultiMarkerRestorer(nn.Module):
             decomposition = self.base_detail_heads[task_key](
                 decoded_features[0],
                 decoded_features[-1],
+                reference_direct_logits=(
+                    prediction_logits[-1]
+                    if self.base_detail_residual_enabled
+                    else None
+                ),
             )
             final_prediction = decomposition.prediction
             predictions[-1] = final_prediction
@@ -359,6 +447,12 @@ class MultiMarkerRestorer(nn.Module):
         if self.sobel is not None:
             model_inputs = torch.cat((inputs, self.sobel(inputs)), dim=1)
         encoded = self._encode(model_inputs)
+        if self.lightweight_detail_unet is not None:
+            detail_updates = self.lightweight_detail_unet(model_inputs)
+            scale_to_index = {1: 0, 2: 1, 4: 2}
+            for scale, update in detail_updates.items():
+                index = scale_to_index[scale]
+                encoded[index] = encoded[index] + update
         context_attention: dict[str, Tensor] = {}
         context_output = None
         if self.context_enabled:
@@ -388,6 +482,8 @@ class MultiMarkerRestorer(nn.Module):
             )
             context_attention["cross_8"] = cross_attention
         _ = organ_id
+        if self.spatial_frequency_mixer is not None:
+            encoded[-1] = self.spatial_frequency_mixer(encoded[-1])
         shared_bottleneck = encoded[-1]
         skips = [encoded[2], encoded[1], encoded[0]]
 

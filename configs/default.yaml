@@ -20,6 +20,7 @@ data:
   input_mode: auto
   target_modes: auto
   num_workers: 8
+  prefetch_factor: 2
   pin_memory: true
   persistent_workers: true
   max_train_samples: null
@@ -37,6 +38,9 @@ data:
     num_bins: 4
     seed: 2026
     num_samples: null
+    strategy: balanced
+    start_ratio: 0.0
+    hard_fraction: 0.0
 
 model:
   name: multi_marker_restorer
@@ -51,6 +55,24 @@ model:
   prototype_temperature: 0.1
   deep_supervision: true
   output_activation: sigmoid
+  base_detail: false
+  base_detail_residual: false
+  spatial_frequency:
+    enabled: false
+    spatial_depth: 1
+    spatial_expansion: 1
+    gate_reduction: 8
+    frequency_cutoff: 0.35
+    frequency_transition_width: 0.08
+    residual_init: 0.0
+  lightweight_unet:
+    enabled: false
+    widths: [16, 24, 32, 48]
+    depths: [1, 1, 1, 1]
+    kernel_size: 7
+    expansion: 2
+    fusion_scales: [1, 2, 4]
+    residual_init: 0.0
   context:
     enabled: false
     grid_size: 3
@@ -82,6 +104,7 @@ loss:
   prototype_activation: 0.001
   prototype_diversity: 0.001
   deep_supervision_weights: [1.0, 0.5, 0.25]
+  deep_supervision_final_weights: null
   pyramid: 0.0
   statistics: 0.0
   schedule: constant
@@ -97,6 +120,15 @@ loss:
     dice_weight: 0.10
     intensity_weight: 0.25
     min_activity_std: 0.01
+  # Final-resolution float-domain metric-alignment auxiliary. The real
+  # uint8/JPEG round trip remains a non-differentiable validation checkpoint.
+  competition_proxy:
+    enabled: false
+    weight: 0.0
+    start_ratio: 0.55
+    ssim_weight: 0.7
+    window_size: 7
+    psnr_cap: 60.0
 
 train:
   device: auto
@@ -124,6 +156,8 @@ train:
   deterministic: false
   cudnn_benchmark: true
   max_oom_retries: 3
+  # Zero disables the budget. Positive values stop safely between epochs.
+  max_wall_time_hours: 0.0
   # auto: show batch progress only in an interactive terminal (for example AutoDL SSH).
   # It stays off for nohup/redirection so train.log remains easy to read with tail.
   progress_bar: auto
@@ -154,6 +188,21 @@ train:
   # NAF/Restormer-lite stack (verified: all reshape/layer_norm paths are
   # channels_last-compatible).
   channels_last: true
+  optimizer_options:
+    enabled: false
+    no_decay_norm_bias: true
+    fused: auto
+  # Output-level D4 consistency inspired by EQ-Reg; no inference overhead.
+  equivariance:
+    enabled: false
+    probability: 0.0
+    weight: 0.0
+    start_ratio: 0.10
+    ramp_end_ratio: 0.40
+    smooth_l1_beta: 0.01
+  gpu_monitor:
+    enabled: false
+    interval_seconds: 2.0
   # Optional torch.profiler trace over the first N training batches. Disabled by
   # default so production training never pays profiling overhead.
   profiler:
