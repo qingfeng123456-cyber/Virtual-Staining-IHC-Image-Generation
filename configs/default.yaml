@@ -195,6 +195,9 @@ inference:
   batch_size: auto
   use_ema: true
   tta: d4
+  # configured: inference.tta is authoritative. validation_decision: a saved
+  # per-target tta_decisions.json may enable or disable D4.
+  tta_policy: configured
   ensemble_checkpoints: []
   jpeg_quality: 100
   jpeg_subsampling: 0

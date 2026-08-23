@@ -219,6 +219,7 @@ configs/initial_round_cd68_retrain_v2.yaml
 - 按 manifest 稳定排序；
 - 保持原图尺寸、mode 和 stem；
 - 可选 D4 测试时增强；
+- 当前 CD68 正式重训配置采用 `tta=d4`、`tta_policy=configured`，因此提交默认强制 D4，不会被不完整的 promotion 审计误关；
 - 支持结构兼容的 checkpoint 平均；
 - learned ensemble 和 model soup 只能使用 validation/OOF；
 - 当前 official test 已识别 1,346 张；若以后更换数据包后 test 缺失或 manifest 为空，正式预测会明确失败；
@@ -520,9 +521,9 @@ python -m virtual_staining.cli --log-root log autodl-run --config configs/initia
 - float、uint8、JPG 三域验证；
 - raw/EMA 分别比较；
 - 连续两阶段 MSE/Charbonnier/SSIM 与小权重荧光前景辅助监督；
-- context、外部预训练、大 Transformer 和扩散模块关闭；训练结束后验证 D4 是否值得启用。
+- context、外部预训练、大 Transformer 和扩散模块关闭；D4 已在完整 1,292 张验证集及全部 5 个 ROI 上确认提高 JPG 指标，因此正式提交默认启用。
 
-这份配置针对上一轮实际使用的 24 GiB RTX 4090。8 GiB 显卡请覆盖为 `--set train.batch_size=2 --set train.gradient_accumulation=8`。上一轮日志推算新流程约 4～5.5 小时，但必须以新 run 实测为准。
+这份配置针对 24 GiB RTX 4090。seed-2026 完整训练实测约 3 小时 25 分、无 OOM；不同 AutoDL 实例和负载下会有波动。8 GiB 显卡请覆盖为 `--set train.batch_size=2 --set train.gradient_accumulation=8`。
 
 ### 9.6 断点续训
 
@@ -555,6 +556,10 @@ python -m virtual_staining.cli --log-root log autodl-submit --config configs/ini
 ~~~
 
 当前 test manifest 已确认有 1,346 行。该一键命令会完成预测、提交打包和 ZIP 校验，成功后应报告 count=1346。它不能在本地计算 test 分数，因为 test 没有标签。
+
+这条命令默认加载验证选择的 EMA 权重并执行 D4。完成后检查
+`outputs/initial_round_v2/cd68_retrain_v2_seed2026/inference_report.json`，其中必须是
+`tta=d4`、`tta_policy=configured`、`loaded_weight_source=ema`、`count=1346`。
 
 ### 10.2 生成结果和 ZIP
 

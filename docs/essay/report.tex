@@ -1201,9 +1201,9 @@ prototypes、organ adapter、calibrator 与 MoE 等可选实现，但 \code{mode
 
 \subsection{测试与推理数据流}
 
-测试 manifest 只有 DAPI。Inferencer 保证 loader 不能随机打乱，然后按稳定顺序预测。当前初赛配置为
-\code{tta=none}，所以每张图只做一次 forward；如果以后显式开启 D4 TTA，
-同一 batch 会经历恒等、$90^\circ$、$180^\circ$、$270^\circ$、水平翻转、垂直翻转、转置和反转置八种
+测试 manifest 只有 DAPI。Inferencer 保证 loader 不能随机打乱，然后按稳定顺序预测。当前正式提交配置为
+\code{tta=d4}、\code{tta\_policy=configured}，因此配置中的 D4 是权威选择，不会被一次不完整的自动晋级
+审计静默关闭。同一 batch 会经历恒等、$90^\circ$、$180^\circ$、$270^\circ$、水平翻转、垂直翻转、转置和反转置八种
 变换。每个预测经过精确逆变换后在 float32 中求平均：
 
 \begin{equation}
@@ -1467,8 +1467,11 @@ bootstrap 真正用于 TTA/promotion 比较路径，例如 \code{command_validat
 训练期验证对 raw、EMA 分别完整评分，然后按 JPG macro SSIM/PSNR选更优来源。独立
 \code{command_validate()} 加载 checkpoint 时，\code{best_jpg} 会读取这个来源；它不是再次自动跑 raw+EMA
 两套。若 \code{inference.tta=d4}，命令还会运行无 TTA 与 D4，并利用同一 ROI 清单做 promotion 判断，
-把每个 target 的决策写入 \code{validation/tta_decisions.json}。预测时若该文件存在，就按 target 应用
-决策；不存在时使用配置本身。当前配置值为 \code{none}，不会默认执行 D4。
+把每个 target 的决策写入 \code{validation/tta_decisions.json}。预测时仅在
+\code{inference.tta\_policy=validation\_decision} 时按 target 应用该文件；正式 CD68 配置采用
+\code{tta\_policy=configured}，因此配置中的 D4 为权威设置，不会被不完整的 promotion 审计覆盖。
+本次 seed-2026 最佳 checkpoint 的 JPG 指标由无 TTA 的 0.804480/25.97599 提升至
+D4 的 0.809280/26.19677，因而正式提交默认执行 D4。
 
 \section{测试与提交详解}
 
@@ -1480,10 +1483,13 @@ test 只有 DAPI，没有 CD68 真值。SSIM/PSNR 都属于 full-reference metri
 
 \subsection{D4、权重来源与 JPEG 保存}
 
-当前推理配置为 \code{use_ema=false}、\code{weight_source=best_jpg}、\code{tta=none}。其中
+当前推理配置为 \code{use_ema=false}、\code{weight_source=best_jpg}、\code{tta=d4}、
+\code{tta\_policy=configured}。其中
 \code{best_jpg} 优先使用 checkpoint 记录的训练期 raw/EMA 胜者；如果旧 checkpoint 没有记录，才根据
-\code{use_ema=false} 回退到 raw，且 checkpoint 没有 EMA 时也会安全使用 raw。源码支持 D4 的八次
-forward，但当前回退版本为了速度默认关闭；只有在 ROI-grouped JPG 验证确实提高后，才应把它改回 D4。
+\code{use_ema=false} 回退到 raw，且 checkpoint 没有 EMA 时也会安全使用 raw。本次 seed-2026 checkpoint
+的训练期胜者是 EMA。完整 1292 张验证集上，D4 把 JPG SSIM 从 0.804480 提高到 0.809280，PSNR 从
+25.97599 dB 提高到 26.19677 dB，且 5 个 ROI 的聚合变化均为正，因此正式提交默认执行八次 forward。
+训练阶段仍不执行 D4；它只增加预测时间，不减少训练 epoch，也不会改变已训练的模型参数。
 
 预测 tensor 先 clamp、乘 255、四舍五入为 uint8，按目标 ImageSpec 保存。当前目标审计为 RGB，所以
 最终模式应为 RGB，而不是 L。

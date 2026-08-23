@@ -1366,6 +1366,29 @@ def command_validate(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _resolve_prediction_tta(
+    configured_tta: Any,
+    policy: str,
+    decisions: Mapping[str, Any],
+    target: str | None,
+) -> str:
+    """Resolve D4 without allowing an inconclusive audit to override config."""
+
+    normalized_tta = str(configured_tta).strip().casefold()
+    configured = "d4" if normalized_tta in {"d4", "true", "1"} else "none"
+    normalized_policy = str(policy).strip().casefold()
+    if normalized_policy == "configured":
+        return configured
+    if normalized_policy != "validation_decision":
+        raise ValueError(
+            "inference.tta_policy must be configured or validation_decision"
+        )
+    decision = decisions.get(target) if target is not None else None
+    if isinstance(decision, Mapping):
+        return "d4" if bool(decision.get("enabled")) else "none"
+    return configured
+
+
 def command_predict(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_effective(args)
     _apply_hardware_defaults(config)
@@ -1387,17 +1410,31 @@ def command_predict(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir).resolve() if args.output_dir else run_dir / "predictions"
     selected_target = normalize_marker(args.target) if args.target else None
     configured_tta = runtime_config["inference"].get("tta", "none")
+    tta_policy = str(
+        runtime_config["inference"].get("tta_policy", "configured")
+    ).strip().casefold()
     decision_path = run_dir / "validation" / "tta_decisions.json"
     decisions = (
         json.loads(decision_path.read_text(encoding="utf-8"))
         if decision_path.is_file()
         else {}
     )
+    use_validation_decisions = tta_policy == "validation_decision"
+    if decisions and not use_validation_decisions:
+        logging.getLogger("virtual_staining").info(
+            "Ignoring validation TTA decisions because inference.tta_policy=%s; "
+            "configured inference.tta=%s is authoritative.",
+            tta_policy,
+            configured_tta,
+        )
 
     def predict_one(target: str | None) -> dict[str, Any]:
-        target_tta: Any = configured_tta
-        if target is not None and target in decisions:
-            target_tta = "d4" if bool(decisions[target].get("enabled")) else "none"
+        target_tta = _resolve_prediction_tta(
+            configured_tta,
+            tta_policy,
+            decisions,
+            target,
+        )
         inferencer = Inferencer(
             model,
             config=runtime_config,
@@ -1406,7 +1443,7 @@ def command_predict(args: argparse.Namespace) -> dict[str, Any]:
         )
         return inferencer.predict_loader(loader, output_dir=output_dir, target=target)
 
-    if selected_target is None and decisions:
+    if selected_target is None and decisions and use_validation_decisions:
         per_target = {
             target: predict_one(target) for target in _selected_targets(runtime_config)
         }
@@ -1418,7 +1455,12 @@ def command_predict(args: argparse.Namespace) -> dict[str, Any]:
         }
     else:
         result = predict_one(selected_target)
-        result["tta_decisions_applied"] = decisions
+        result["tta_decisions_applied"] = (
+            decisions if use_validation_decisions else {}
+        )
+    result["tta_decisions_available"] = decisions
+    result["tta_policy"] = tta_policy
+    result["configured_tta"] = str(configured_tta).strip().casefold()
     result["loaded_weight_source"] = checkpoint_payload["loaded_weight_source"]
     result["context_enabled"] = bool(runtime_config["inference"].get("context", False))
     result["output_dir"] = str(output_dir)

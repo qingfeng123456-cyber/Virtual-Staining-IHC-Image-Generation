@@ -47,10 +47,10 @@ python -m virtual_staining.cli --log-root log autodl-run \
 3. 数据审计（ROI 对齐、泄漏检查）→ `artifacts/data_audit.json`
 4. 训练最多 84 epoch（16.2M 参数的 NAF 风格 MultiMarkerRestorer base64，不是更大的 Transformer）
 5. 每 3 epoch 比较 raw/EMA，并以最终 JPG round-trip SSIM 为主选择 checkpoint
-6. 训练结束比较无 TTA 与 D4 TTA，写入三域指标和 ROI 分组结果 → `validation/metrics.json`
+6. 训练结束比较无 TTA 与 D4 TTA，写入三域指标和 ROI 分组结果；正式提交配置固定使用 D4 → `validation/metrics.json`
 7. 写入汇总报告 → `outputs/initial_round_v2/<run-id>/pipeline_report.json`
 
-**预期耗时：** 根据上一轮 RTX 4090 实测日志估算约 4～5.5 小时；这是预算估算，不是已完成的新训练时长。模型或磁盘速度不同会改变耗时，但每 3 epoch 验证可明显减少验证占用。
+**实测耗时：** seed-2026 在 RTX 4090 D 上完成 84 epoch 用时 3 小时 25 分，无 OOM；其他机器仍以实际日志为准。
 
 **快速验证（可选）：** 加 `--max-epochs 3` 跑 3 epoch 确认流程通畅，再跑完整训练。
 
@@ -60,10 +60,10 @@ python -m virtual_staining.cli --log-root log autodl-run \
 python -c "
 import json
 m = json.load(open('outputs/initial_round_v2/cd68_retrain_v2_seed2026/validation/metrics.json'))
-jpg = m['domains']['jpg']['macro']
-print('JPG SSIM:', round(jpg['mean_ssim'], 4))
-print('JPG PSNR:', round(jpg['mean_psnr'], 2))
-print('ROI SSIM:', round(m['domains']['jpg']['macro']['roi_ssim'], 4))
+plain = m['domains']['jpg']['macro']
+d4 = m['tta_comparison']['d4']['domains']['jpg']['macro']
+print('无 TTA:', round(plain['mean_ssim'], 6), round(plain['mean_psnr'], 5))
+print('D4:', round(d4['mean_ssim'], 6), round(d4['mean_psnr'], 5))
 "
 ```
 
@@ -74,7 +74,7 @@ print('ROI SSIM:', round(m['domains']['jpg']['macro']['roi_ssim'], 4))
 | `outputs/initial_round_v2/<run-id>/validation/metrics.json` | 完整验证指标（float/uint8/jpg 三域，ROI 分组，分层） |
 | `outputs/initial_round_v2/<run-id>/validation/per_image.csv` | 无 TTA 的逐图 SSIM/PSNR |
 | `outputs/initial_round_v2/<run-id>/validation/per_image_tta_d4.csv` | D4 TTA 的逐图 SSIM/PSNR |
-| `outputs/initial_round_v2/<run-id>/validation/tta_decisions.json` | 是否启用 D4 的验证集决策 |
+| `outputs/initial_round_v2/<run-id>/validation/tta_decisions.json` | 保守 promotion 审计；正式配置采用 `tta_policy=configured` 时仅作诊断，不覆盖 D4 |
 | `outputs/initial_round_v2/<run-id>/pipeline_report.json` | 汇总报告（环境+训练+验证） |
 | `outputs/initial_round_v2/<run-id>/checkpoints/best_ssim.ckpt` | 最佳 checkpoint |
 
@@ -99,9 +99,33 @@ python -m virtual_staining.cli --log-root log autodl-submit \
 
 **这条命令自动完成：**
 1. 加载明确指定的 `best_ssim.ckpt`，避免存在多个 run 时选错模型
-2. 对官方 test 集（1346 张 DAPI）推理，并按 checkpoint/effective config 使用已选择的 raw/EMA 权重和 TTA 设置 → `predictions/`
+2. 对官方 test 集（1346 张 DAPI）使用最佳 EMA 权重和默认 D4 推理 → `predictions/`
 3. 构建竞赛要求的 `results/` 目录结构与 ZIP → `submission/`
 4. 严格校验 ZIP（文件名、数量、尺寸、模式）
+
+当前正式配置明确写有：
+
+```yaml
+inference:
+  weight_source: best_jpg
+  tta: d4
+  tta_policy: configured
+```
+
+`configured` 表示配置中的 D4 是权威设置。即使旧 run 的
+`tta_decisions.json` 因器官字段为 `unknown` 而错误记录 `enabled=false`，提交程序也会忽略该错误决策，不需要删除或修改日志文件。
+
+提交完成后必须核对：
+
+```bash
+python -c "import json; r=json.load(open('outputs/initial_round_v2/cd68_retrain_v2_seed2026/inference_report.json')); print('TTA=',r['tta'],'策略=',r['tta_policy'],'权重=',r['loaded_weight_source'],'数量=',r['count'])"
+```
+
+正确输出应包含：
+
+```text
+TTA= d4 策略= configured 权重= ema 数量= 1346
+```
 
 ### 上传竞赛平台
 
@@ -112,6 +136,19 @@ outputs/initial_round_v2/cd68_retrain_v2_seed2026/submission/submission_CD68.zip
 ```
 
 将此 ZIP 上传到竞赛平台，平台返回的分数才是 official test score。
+
+## 为什么训练时不运行 D4、提交时运行 D4
+
+D4 是测试时增强，不是训练模块。训练仍然使用随机同步旋转/翻转，每个 batch 只做一次前后向；提交时则对同一张 DAPI 分别进行 8 种旋转/翻转，预测后恢复方向并平均。它不修改 checkpoint，也不使用测试标签，只增加推理计算量。
+
+本次同一 `best_ssim.ckpt`、同一 1,292 张验证集的实测结果：
+
+| 推理方式 | JPG SSIM | JPG PSNR |
+| --- | ---: | ---: |
+| 无 TTA | 0.804480 | 25.97599 |
+| D4 | **0.809280** | **26.19677** |
+
+D4 在 5 个验证 ROI 上的 SSIM 和 PSNR 都提高，因此正式 CD68 配置默认启用。代价只发生在预测阶段，不会让训练变成 8 倍。
 
 ## 可选：仅有一个训练 run 时自动选择 checkpoint
 

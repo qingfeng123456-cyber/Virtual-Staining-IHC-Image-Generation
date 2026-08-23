@@ -101,6 +101,9 @@ inference:
   use_ema: false
   weight_source: best_jpg
   tta: d4
+  # D4 improved every validation ROI in the completed seed-2026 run. Keep it
+  # authoritative even if the conservative promotion audit is inconclusive.
+  tta_policy: configured
 
 pretrain:
   enabled: false

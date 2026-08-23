@@ -68,6 +68,7 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
     "inference": {
         "device", "batch_size", "use_ema", "tta", "amp", "ensemble_checkpoints",
         "jpeg_quality", "jpeg_subsampling", "jpeg_optimize", "context", "weight_source",
+        "tta_policy",
     },
     "submission": {
         "root_name", "split_name", "fake_suffix", "extension", "create_zip",
@@ -343,6 +344,16 @@ def validate_config(config: dict[str, Any]) -> None:
         value = config[section].get(key)
         if value != "auto" and int(value) < 1:
             raise ConfigError(f"{section}.{key} must be positive or 'auto'")
+    inference_tta = str(config["inference"].get("tta", "none")).strip().casefold()
+    if inference_tta not in {"none", "d4"}:
+        raise ConfigError("inference.tta must be none or d4")
+    tta_policy = str(
+        config["inference"].get("tta_policy", "configured")
+    ).strip().casefold()
+    if tta_policy not in {"configured", "validation_decision"}:
+        raise ConfigError(
+            "inference.tta_policy must be configured or validation_decision"
+        )
     weight_sources = config["train"].get("evaluate_weight_sources")
     if weight_sources is not None:
         if not isinstance(weight_sources, list) or not weight_sources:
