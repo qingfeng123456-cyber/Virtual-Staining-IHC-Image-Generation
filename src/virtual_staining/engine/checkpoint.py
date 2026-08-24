@@ -34,15 +34,40 @@ def capture_rng_state() -> dict[str, Any]:
     return state
 
 
+def _cpu_byte_rng_state(value: Any, *, name: str) -> torch.Tensor:
+    """Normalize a serialized generator state for PyTorch RNG APIs.
+
+    A checkpoint loaded with ``map_location=cuda`` also maps the originally
+    CPU RNG ByteTensor to CUDA.  ``torch.set_rng_state`` and
+    ``Generator.set_state`` nevertheless require a CPU uint8 tensor.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    try:
+        return torch.as_tensor(value, dtype=torch.uint8, device="cpu").contiguous()
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise TypeError(f"{name} must be convertible to a CPU torch.ByteTensor") from error
+
+
 def restore_rng_state(state: dict[str, Any] | None) -> None:
     """Restore an RNG state captured by :func:`capture_rng_state`."""
     if not state:
         return
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch_cpu"])
+    torch.set_rng_state(_cpu_byte_rng_state(state["torch_cpu"], name="torch_cpu RNG state"))
     if "torch_cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        cuda_state = state["torch_cuda"]
+        cuda_states = (
+            list(cuda_state)
+            if isinstance(cuda_state, (list, tuple))
+            else [cuda_state]
+        )
+        normalized = [
+            _cpu_byte_rng_state(value, name=f"torch_cuda RNG state {index}")
+            for index, value in enumerate(cuda_states)
+        ]
+        torch.cuda.set_rng_state_all(normalized[: torch.cuda.device_count()])
 
 
 def detect_git_commit(workdir: str | Path | None = None) -> str | None:
@@ -176,7 +201,12 @@ def load_checkpoint(
         restore_rng_state(payload.get("rng_state"))
     generator_state = payload.get("dataloader_generator_state")
     if dataloader_generator is not None and generator_state is not None:
-        dataloader_generator.set_state(generator_state.cpu())
+        dataloader_generator.set_state(
+            _cpu_byte_rng_state(
+                generator_state,
+                name="DataLoader generator state",
+            )
+        )
     return payload
 
 
