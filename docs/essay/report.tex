@@ -86,7 +86,7 @@
 \title{\textbf{CAMP-VS 虚拟染色竞赛项目技术报告}\\[0.6em]
 \large 从 DAPI 图像到 CD68 虚拟染色的完整工程解析}
 \author{基于当前项目源码、配置与本地官方数据审计结果整理}
-\date{源码核对日期：2026 年 8 月 23 日}
+\date{源码核对日期：2026 年 8 月 24 日}
 
 \begin{document}
 
@@ -97,10 +97,11 @@
 虚拟染色竞赛工程。项目把一张 DAPI 荧光显微镜图像作为输入，预测同一位置的
 CD68 标记图像。本文从生物学背景讲起，逐步解释数据目录、ROI 分组、manifest、
 PyTorch DataLoader、Sobel 结构提示、四尺度 NAF 编解码器、余弦原型混合、任务适配器、
-固定权重复合损失、混合精度训练、EMA、三域验证、可选 D4 测试时增强和提交 ZIP 的产生过程。
+重型四尺度 Detail U-Net、自适应空间--频率路线、三路内容感知融合、真实 $3\times3$ ROI 邻域、两阶段复合损失、
+混合精度训练、EMA、三域验证、D4 测试时增强和提交 ZIP 的产生过程。
 
 报告不是根据模型名称猜测而写，而是逐项核对了当前工作区中的
-\code{README.md}、\code{docs/AUTODL_RUN.md}、默认/初赛/resolved-local 三份 YAML 配置、CLI、训练器、
+\code{README.md}、\code{docs/essay/report.tex}、默认/初赛/v2/v3/v4/resolved-local YAML 配置、CLI、训练器、
 验证器、模型、损失、数据集、指标及提交代码，并读取了本地官方数据审计结果。
 因此，本文会特别指出三项容易被误解的事实：第一，本地 JPG 在磁盘上是 RGB，
 只是三个通道逐像素完全相同；第二，
@@ -112,8 +113,9 @@ PyTorch DataLoader、Sobel 结构提示、四尺度 NAF 编解码器、余弦原
 \important{\textbf{阅读方法。} 如果你只学过计算机专业的机器学习和深度学习课程，请不要跳过第 1 节。
 这一节先建立“组织--ROI--patch--细胞--像素”的共同语言，再解释五个 marker、荧光强度、监督标签和
 评价层级；理解这些概念后，后面的网络结构和损失函数才不只是公式。如果你只想在 AutoDL 上跑通项目，
-可直接阅读附录“从零到提交的操作清单”。文中“当前配置”专指
-\code{configs/default.yaml} 与 \code{configs/initial_round_cd68.yaml} 合并后的实际设置。}
+可直接阅读附录“AutoDL 从上传到训练的保姆级流程”。文中“稳定对照”指
+\code{configs/initial_round_cd68_retrain_v2.yaml}；“v3”是已停止的轻量多分支候选；“当前候选”或“v4”专指
+\code{configs/initial_round_cd68_max_v4.yaml} 与默认/resolved-local 配置合并后的实际设置。}
 
 \tableofcontents
 \listoffigures
@@ -547,8 +549,8 @@ SSIM 在局部窗口比较亮度、对比度和结构\cite{ssim}，比单纯 MSE
 
 \begin{lstlisting}[style=shell]
 python -m virtual_staining.cli --log-root log autodl-run \
-  --config configs/initial_round_cd68.yaml \
-  --data-root AUTO --target CD68 --run-id cd68_v2_seed2026
+  --config configs/initial_round_cd68_max_v4.yaml \
+  --data-root AUTO --target CD68 --run-id cd68_max_v4_seed2026
 \end{lstlisting}
 
 \subsection{把命令逐段拆开}
@@ -628,8 +630,8 @@ python -m virtual_staining.cli --log-root log autodl-run \
   \item \code{command_env()} 收集 Python、PyTorch、CUDA、GPU、CPU 和内存信息，写入 \code{artifacts/environment.json}。
   \item \code{discover_data_root()} 对有限候选目录打分；当前数据根为 \code{dataset/official}。
   \item \code{_ensure_manifests()} 配对文件并建立 train、val、test 与 smoke CSV；随后 \code{audit_data()} 统计尺寸、通道、值域、相关性和对齐情况。
-  \item \code{_run_train()} 合并配置、构建 DataLoader、\code{MultiMarkerRestorer}、固定权重 \code{CompositeRestorationLoss}、AdamW、Trainer 与 Validator；\code{Trainer.fit()} 按配置训练 120 epoch。
-  \item 训练内部在每个验证 epoch 比较 raw 与 EMA。训练结束后，\code{command_validate()} 再加载最佳 checkpoint 中记录的选中权重来源，输出逐图和汇总指标；当前初赛配置的推理 TTA 为 \code{none}，只有显式改成 D4 才会额外执行八变换比较。
+  \item \code{_run_train()} 合并配置、构建带 hard-mix activity sampler 的 DataLoader、\code{MultiMarkerRestorer}、scheduled composite loss、分组 fused AdamW、Trainer 与 Validator；\code{Trainer.fit()} 最多训练 100 epoch，并受 early stopping 与 8.5 小时预测式安全停点约束。
+  \item v4 每 5 epoch 比较 raw 与 EMA；15\% batch 还会执行一次随机 D4 等变一致性分支。训练结束后，\code{command_validate()} 加载最佳 checkpoint 中记录的选中权重来源，输出逐图和汇总指标；当前 v4 推理固定使用 \code{tta=d4} 与 \code{tta\_policy=configured}。
   \item \code{pipeline_report.json} 汇总环境、数据、训练和验证路径。CLI 成功结束时，日志会复制关键轻量文件并生成 \code{autodl-run_log_bundle.zip}。
 \end{enumerate}
 
@@ -721,7 +723,7 @@ CD68 & 6296 & $256\times256$ & 3 & 1 & RGB \\
 \label{tab:image-spec}
 \end{table}
 
-\important{\code{initial_round_cd68.yaml} 本身没有重复写通道数，但配置加载器随后合并
+\important{\code{initial_round_cd68_max_v4.yaml} 明确写入 1 个逻辑输入/输出通道，配置加载器还会合并
 \code{configs/resolved_local.yaml}；该文件根据审计结果设置 \code{data.input_channels: 1}，并把四个
 target 的逻辑通道数都设为 1。因此当前 Dataset 与模型实际按 $[B,1,256,256]$ 运行，输出也是单通道
 逻辑张量。这里的“单通道训练”不等于把原始文件改成 mode L：官方 JPEG 仍保持只读 RGB，提交保存时
@@ -731,8 +733,9 @@ target 的逻辑通道数都设为 1。因此当前 Dataset 与模型实际按 $
 
 文件名使用 \code{ROI{编号}_{行}_{列}.jpg}。manifest 中旧的 \code{parse_roi_id()} 会提取
 \code{ROI000} 用于分组；更严格的 \code{parse_patch_coordinate()} 可进一步解析行列，供网格审计、
-边界/内部分类和可选邻域模型使用。当前初赛配置的 \code{model.context.enabled=false}，因此训练只使用
-中心 patch，不会偷偷拼接相邻图块。
+边界/内部分类和邻域模型使用。当前 v4 配置的 \code{model.context.enabled=true}，但
+\code{require_verified_grid=true}：只有文件名坐标、行列方向、边界连续性和 split 隔离审计全部通过，
+才会读取同一 ROI 的 $3\times3$ DAPI 邻域；缺失位置由 mask 表示，目标 marker 永远不作为 context 输入。
 
 坐标有空洞并不一定代表数据损坏。例如 ROI 网格可能只保留组织区域，背景 patch 被排除。程序只把
 真实存在的文件写入 manifest，不会凭空生成缺失坐标。
@@ -785,11 +788,10 @@ test & 1346 & 5 & 只有 DAPI；用于生成提交 \\
   \item 返回输入、targets 字典、stem、ROI、organ、split 和路径元数据。
 \end{enumerate}
 
-当前 DataLoader 使用 \code{batch_size=8}、\code{num_workers=0}。虽然 default/初赛配置分别写过
-\code{pin_memory=true} 与 \code{persistent_workers=true}，但加载器只有在 CUDA 可用时才真正 pin memory，
-并且 workers 为 0 时会强制令 persistent 为 false。因此当前图片由主进程同步解码；这个设置最兼容
-Windows，也可能让高端 AutoDL GPU 等待 I/O。若要在服务器提高 workers，必须用新的 effective config
-记录并先做吞吐/稳定性 A/B，不能把 YAML 中被覆盖的 8 误报成已经生效。
+v4 YAML 在 AutoDL/Linux 上使用 \path{batch_size=6}、\path{gradient_accumulation=2}、\path{num_workers=8}、\path{prefetch_factor=4}、
+\path{pin_memory=true} 与 \path{persistent_workers=true}，以并发解码减少 4090 等待。加载器只在 CUDA
+可用时真正 pin memory；Windows 本地若 worker 不稳定，可用 CLI 覆盖为 0，此时程序也会关闭 persistent。
+每次运行都应以日志中的 effective config 为准，而不能只看源 YAML 猜测最终生效值。
 
 \subsection{PairedTransform 为什么必须“成对”}
 
@@ -803,10 +805,12 @@ gamma/亮度/对比度概率各 0.5、噪声概率 0.25、模糊概率 0，平�
 
 \subsection{先建立整体直觉：这是一个“先压缩理解，再放大还原”的网络}
 
-当前初赛 YAML 选择的 \code{MultiMarkerRestorer} 可以看成 U-Net 风格的编码器--解码器\cite{unet}。编码器逐级减小宽高、增加通道，
+当前 v4 候选以 \code{MultiMarkerRestorer} 为核心，可以看成带三条互补特征路线的 U-Net 风格编码器--解码器\cite{unet}。编码器逐级减小宽高、增加通道，
 把像素转成更抽象的特征；解码器再逐级放大，并从编码器拿回高分辨率 skip feature，恢复细节。
 与普通 U-Net 不同的是，本模型用 NAF block 负责恢复，在 $1/8$ 瓶颈用共享/任务余弦原型混合语义，
-并在每个解码尺度用 CD68 task adapter 做条件调制。整体结构如图~\ref{fig:model-overview}。
+并在每个解码尺度用 CD68 task adapter 做条件调制。图~\ref{fig:model-overview}先画出 v4 从稳定 v2
+继承的 NAF 主干；图~\ref{fig:v4-triroute}再展开当前真正启用的 Heavy Omni U、自适应频率、内容感知
+融合与 ROI context。v3 轻量分支只作为历史对照单独保留，绝不是当前 v4 前向的一部分。
 
 \begin{figure}[H]
 \centering
@@ -841,9 +845,169 @@ gamma/亮度/对比度概率各 0.5、噪声概率 0.25、模糊概率 0，平�
 \draw[skip] (e2) to[bend left=15] (d2);
 \draw[skip] (e1) to[bend right=14] (d1);
 \end{tikzpicture}}
-\caption{当前初赛配置的 MultiMarkerRestorer 主干。图中按实际单逻辑通道标注输入/输出；prototype 与 task adapter 开启，context、cross-attention 和 base/detail 关闭。}
+\caption{v4 继承的 MultiMarkerRestorer NAF 核心主干。图中按实际单逻辑通道标注输入/输出；当前重型三路增量见图~\ref{fig:v4-triroute}。}
 \label{fig:model-overview}
 \end{figure}
+
+\subsection{历史 v3 对照：轻量 U、固定频率与稳定输出（当前未启用）}
+
+本小节用于解释旧配置和旧 checkpoint，不能拿来描述当前 v4。v3 候选不是把主干替换成一个更大的 Transformer，而是在已验证的 NAF U 形网络旁边增加四条互补、
+可由 feature flag 独立关闭的路径，如图~\ref{fig:v3-branches}。这遵循高效卷积复原网络的经验：
+局部大核/深度可分离卷积可以用较少参数补充细节\cite{convir,oknet}；频率分解可以显式区分平滑强度与
+高频纹理\cite{adair}；训练期等变约束可以减少旋转/翻转后的输出不一致\cite{eqreg}。这些文献只提供
+设计依据，本工程是针对 DAPI$\rightarrow$CD68 和单卡 4090 预算的 clean-room 实现，不复制论文权重或结果。
+
+\begin{figure}[H]
+\centering
+\resizebox{0.98\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=6mm,
+  io/.style={draw,rounded corners,align=center,fill=CampGreen!12,text width=24mm,minimum height=12mm},
+  core/.style={draw,rounded corners,align=center,fill=CampBlue!10,text width=30mm,minimum height=12mm},
+  branch/.style={draw,rounded corners,align=center,fill=CampPurple!12,text width=34mm,minimum height=12mm},
+  head/.style={draw,rounded corners,align=center,fill=CampOrange!15,text width=35mm,minimum height=12mm},
+  arr/.style={-{Latex[length=2mm]},thick},
+  res/.style={-{Latex[length=2mm]},dashed,thick,CampPurple}
+]
+\node[io] (x) {中心 DAPI\\+ Sobel};
+\node[core,right=of x] (enc) {四尺度 NAF\\主编码器};
+\node[core,right=of enc] (bottle) {$1/8$ bottleneck\\prototype};
+\node[core,right=of bottle] (dec) {共享 decoder\\task adapters};
+\node[head,right=of dec] (head) {direct logits\\+ zero-init base/detail};
+\node[io,right=of head] (y) {CD68\\预测};
+\draw[arr] (x)--(enc)--(bottle)--(dec)--(head)--(y);
+
+\node[branch,above=12mm of enc] (detail) {轻量 Detail U-Net\\大核 depthwise/gated\\注入 $1,1/2,1/4$ skip};
+\draw[arr] (x) |- (detail);
+\draw[res] (detail)--(enc);
+
+\node[branch,below=13mm of enc] (ctx) {$3\times3$ ROI DAPI tiles\\tiny shared encoder\\FiLM at $1/4,1/8$};
+\draw[res] (ctx)--(enc);
+\draw[res] (ctx) to[bend right=12] node[below,align=center]{9-token\\cross-attention} (bottle);
+
+\node[branch,below=13mm of bottle] (fft) {parallel spatial/frequency\\NAF + float32 FFT low/high\\channel softmax gate};
+\draw[res] (bottle)--(fft);
+\draw[res] (fft)--(dec);
+
+\node[branch,below=13mm of head] (d4) {训练期 D4 consistency\\25\% batch 额外一次变换\\推理仍按配置执行 D4};
+\draw[res] (d4)--(head);
+\end{tikzpicture}}
+\caption{历史 v3 增量路径，仅供兼容与对照；当前 v4 已用 Heavy Omni U 和三路门控替换轻量 U/固定频率组合。}
+\label{fig:v3-branches}
+\end{figure}
+
+\paragraph{轻量 Detail U-Net。}
+它使用宽度 $[16,24,32,48]$ 的四尺度 U 形分支，每层由 $7\times7$ depthwise convolution、
+$1\times1$ expansion 和乘法 gate 组成。解码结果只向主干的全分辨率、$1/2$、$1/4$ skip 注入；
+$1/8$ 留给空间--频率 mixer，避免重复计算。三个注入投影严格零初始化，所以启用分支时第 0 步
+不改变旧主干输出。该分支约增加 72,016 个参数和 0.589 GMAC。
+
+\paragraph{空间--频率瓶颈。}
+同一个 $32\times32$ bottleneck 一路进入局部 NAF，一路在 float32 中执行 rFFT，使用平滑径向 mask
+拆成 low/high bands，再由逐通道 softmax gate 融合。最终 projection 乘零初始化 residual scale 后
+接回主干。FFT 强制 float32 是为了 CUDA 数值/shape 兼容，其余卷积继续在 BF16 autocast 下运行。
+
+\paragraph{真实 ROI context。}
+文件名 \code{ROI007_09_11} 可解析为 ROI、row、col；数据审计已经确认官方 train/val 没有共享 ROI 或
+跨 split 邻接边，行列方向连续。\code{NeighborhoodDataset} 因此可以安全读取中心周围最多 9 张 DAPI，
+并返回 valid mask 与二维 offsets。增强会同步变换 tiles、mask 和 offsets；中心 tile 强制与主输入逐位一致。
+若换数据后文件名网格无法验证，\code{require_verified_grid=true} 会拒绝训练，不会根据图像内容猜坐标。
+
+\paragraph{稳定 base/detail。}
+旧 base/detail 会用随机新头直接替换最终 output head，单次重训风险较高。v3 引入且 v4 继续使用的
+\code{base_detail_residual=true} 改为
+\begin{equation}
+  z_{\mathrm{final}}=z_{\mathrm{direct}}
+  +\Delta z_{\mathrm{coarse}}
+  +a\tanh(\Delta z_{\mathrm{detail}}),\qquad a=0.5,
+\end{equation}
+其中 coarse 和 detail 的最终投影都从 0 初始化。因此第 0 步 prediction 与旧 direct head 逐位一致，
+但两个投影在第一次 backward 都能获得梯度。
+
+\subsection{v4 重型三路主线：为什么替换轻量 U，却不删除旧模型}
+
+v3 的轻量 Detail U 只有 72,016 个参数，只向三个 skip 输出零初始化更新，
+没有独立的解码细化和 $1/8$ 瓶颈路线。它适合做低风险增量，但不能满足“重型 U-Net
+与另外两路平行后再融合”的设计意图。因此 v4 使用新的
+\path{models/heavy_detail_unet.py}，宽度为 $[56,88,128,176]$，编码深度为
+$[3,4,6,6]$，解码细化深度为 $[1,2,3]$。全分辨率和 $1/2$ 尺度使用
+$3\times3$ depthwise spatial mixing 与稠密 $1\times1$ gated channel mixer，便于 4090
+Tensor Core 批量执行；$1/4$ 和 $1/8$ 尺度再并行混合局部 $3\times3$、
+$1\times11+11\times1$ 轴向大核与空洞卷积。这一 clean-room 组合受 ConvIR 的
+多尺度卷积恢复、OKNet 的 omni-kernel 及 DarkIR 的多尺度空间建模启发
+\cite{convir,oknet,darkir}，但没有复制它们的预训练权重或实验数字。
+
+\begin{figure}[H]
+\centering
+\resizebox{0.98\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=7mm and 9mm,
+  io/.style={draw,rounded corners,align=center,fill=CampGreen!12,text width=23mm,minimum height=12mm},
+  route/.style={draw,rounded corners,align=center,fill=CampBlue!10,text width=38mm,minimum height=18mm},
+  fusion/.style={draw,rounded corners,align=center,fill=CampPurple!14,text width=38mm,minimum height=15mm},
+  head/.style={draw,rounded corners,align=center,fill=CampOrange!16,text width=38mm,minimum height=15mm},
+  arr/.style={-{Latex[length=2.2mm]},thick}
+]
+\node[io] (x) {DAPI + Sobel\\$256\times256$};
+\node[route,right=12mm of x,yshift=23mm] (naf) {Route A: NAF 主干\\四尺度局部/结构特征};
+\node[route,right=12mm of x] (heavy) {Route B: Heavy Omni U\\四尺度解码细胞细节};
+\node[route,right=12mm of x,yshift=-23mm] (freq) {Route C: Adaptive FFT\\学习 low/high 与双向调制};
+\node[fusion,right=16mm of heavy] (fuse) {$1,1/2,1/4$: 双路 gate\\$1/8$: 三路 softmax + 2 SDPA};
+\node[head,right=of fuse] (head) {ROI context + prototype\\decoder + adapter\\base/detail + deep supervision};
+\node[io,right=of head] (y) {CD68\\prediction};
+\draw[arr] (x)--(naf); \draw[arr] (x)--(heavy); \draw[arr] (x)--(freq);
+\draw[arr] (naf)--(fuse); \draw[arr] (heavy)--(fuse); \draw[arr] (freq)--(fuse);
+\draw[arr] (fuse)--(head)--(y);
+\end{tikzpicture}}
+\caption{v4 的三路主线。“并行”指三类特征在同一 autograd 计算图中分别计算，
+再由内容相关门控融合；不是三个进程各占一块 GPU。}
+\label{fig:v4-triroute}
+\end{figure}
+
+\paragraph{自适应频率路线。}
+v3 对每张图都使用固定 cutoff $0.35$。v4 在这个稳定先验上根据当前 patch
+预测有界的 cutoff 偏移和 transition 宽度，然后让池化的 high band 调制 low band，
+low band 反过来调制 high band。这一“先分频、再双向交互”的思路受 AdaIR
+\cite{adair} 启发，但要特别注意：AdaIR 处理噪声、雨、雾等退化，本项目是
+DAPI$\rightarrow$CD68 跨 marker 映射，所以这只是候选归纳偏置，不能由论文结果推导一定涨分。
+FFT 仍固定使用 float32，学习投影仍享受 BF16 AMP。v4 调用
+\code{ParallelSpatialFrequencyMixer.forward_route()} 取得不含输入 identity 的 spatial--frequency update，
+再将它作为真正独立的 Route C 送入三路融合；旧 v3/非三路配置仍调用兼容的
+\code{forward(x)=x+forward_route(x)}，所以旧 checkpoint 行为和 state keys 不变。
+
+\paragraph{内容感知融合。}
+对于第 $r$ 条路的特征 $\mathbf F_r$，代码先做 LayerNorm2d 与 $1\times1$ 通道对齐，
+再同时根据全局通道描述子和局部空间特征预测 logits：
+\begin{equation}
+ w_r(c,h,w)=\operatorname{softmax}_{r}\!\left(g_r^{\mathrm{channel}}(c)+
+ g_r^{\mathrm{spatial}}(h,w)\right),\qquad \sum_r w_r=1.
+\end{equation}
+$1,1/2,1/4$ 尺度融合 NAF 与 Heavy U；$1/8$ 尺度融合 NAF、Heavy U 与
+adaptive spatial-frequency。瓶颈后只使用两层原生 PyTorch
+scaled-dot-product attention 做 Restormer 式转置通道注意力，避免在 $256^2$ token 上构建
+昂贵的全局 Transformer。低分辨率 attention 是对全局交互的有界投资；ESC 对
+高效 attention/卷积替代的分析进一步支持“不在高分辨率机械堆标准 Transformer”
+的工程选择\cite{esc}。
+
+融合不使用严格零初始化，而是以 $\alpha=0.05$ 小残差起步；频率内路尺度初值为 1，
+稳定性由外层 $\alpha$ 统一控制。这避免“内层尺度等于 0，外层尺度也等于 0”导致分支
+前几步完全收不到梯度。实际 BF16 forward/backward 检查已确认 Heavy U、adaptive frequency、
+fusion 和 context 都有非零梯度。
+
+\paragraph{日志如何证明分支真的参与。}
+\code{RestorationOutput.fusion\_diagnostics} 每次前向返回四个尺度的 route gate 均值、
+归一化熵、Heavy/Main 与 Frequency/Main 范数比、独立 frequency route/input RMS 比、融合尺度，以及 adaptive cutoff、
+transition 和 low/high modulation gate。Trainer 不会每 batch 调用 \code{item()} 强制 GPU 同步；
+它在设备上用 float32 累加，epoch 末统一写入
+\path{log/<run>/epoch_metrics.jsonl} 和 \path{performance_summary.json}。这些值不是竞赛性能指标，
+而是诊断“门控是否塌缩到某一路”、“新分支是否一直近似零”的工程证据。
+
+\paragraph{为什么不物理删除 Restormer、CAMP-VS v2 和 ensemble。}
+这些文件在 v4 YAML 下不会被实例化，因此不占用 v4 的 GPU 显存或每轮计算时间；
+物理删除只会省下很小的源码空间，却会破坏旧 checkpoint 读取、配置回放、消融和回滚。
+ensemble 更不是单模型 forward 中的一个开关，而是至少两个独立 checkpoint 训练完成后的
+推理融合阶段。完整 Mamba 本轮也不进主线：它会引入 selective-scan CUDA 扩展、环境风险，
+而“理论 FLOPs 较低”不自动等于 4090 实际吞吐更高。
 
 \subsection{输入预处理与 Sobel 结构提示}
 
@@ -952,7 +1116,9 @@ $\odot$ 表示逐元素相乘。直观地说，一半特征像“内容”，另
 
 \subsection{瓶颈处的共享/任务余弦原型混合}
 
-当前主线没有调用 Restormer-lite；它调用的是 \code{MultiTaskPrototypeMixer}。把
+原型混合器本身没有被 Restormer 替换；它仍调用 \code{MultiTaskPrototypeMixer}。v4 只在三路特征进入
+原型层之前增加两层低分辨率原生 PyTorch SDPA 精炼，因此全局交互和 shared/task prototype 是先后互补而非
+两套互斥主模型。随后把
 $\mathbf{F}\in\mathbb{R}^{B\times512\times32\times32}$ 展平后，每个空间位置成为一个 512 维 token，
 总计 1024 个 token。代码把 token、8 个 shared prototype 和 8 个 CD68 task prototype 都做 $L_2$
 归一化，再计算余弦相似度和温度为 0.1 的 softmax：
@@ -1019,56 +1185,57 @@ task embedding；它不调用 CAMP-VS v2 的 organ conditioner。
 LayerNorm2d、depthwise $3\times3$、GELU 和 $1\times1$ pointwise 路径，残差尺度也从 0 开始。
 当前只有 CD68 一个任务，embedding 不能在多个 marker 之间做选择，但接口保留了以后多任务扩展能力。
 
-\subsection{直接输出头：当前没有 base/detail 与强度校准}
+\subsection{direct output 与零初始化 base/detail residual}
 
-当前 \code{model.base_detail=false}。所以模型不会调用 \code{LaplacianBaseDetailHead}，也不会把预测拆成
-低频 base 和高频 detail；每个解码尺度只是执行 $1\times1$ 卷积与 sigmoid：
+v3/v4 都保留每个解码尺度的 direct $1\times1$ output head；当前 v4 在最终 $256\times256$ 尺度开启
+\code{LaplacianBaseDetailHead} 的 residual-to-reference 模式。direct 路径仍为
 
 \begin{equation}
   \widehat{\mathbf y}_s=\sigma\!\left(\operatorname{Conv}_{1\times1}(\mathbf F_s)\right),
   \qquad s\in\{64,128,256\}.
 \end{equation}
 
-当前主线也不实例化 \code{GlobalIntensityCalibrator}。这两个模块虽然仍存在于可选 CAMP-VS v2 源码中，
-但不能写成当前较优回退版本的有效组成部分。
+最终尺度再按上一节公式加入零初始化 coarse/detail residual。全局强度标定器
+\path{GlobalIntensityCalibrator} 仍未启用，因为本轮没有验证证据表明它能稳定提高 JPG 指标。
 
 \subsection{Deep Supervision}
 
 \term{深监督}{Deep Supervision}是在中间解码层也产生预测，让浅层和深层都直接收到训练信号。
-当前只有三个输出尺度：$256$、$128$、$64$。损失按照从大到小排序，对它们依次使用
-$[1.0,0.5,0.25]$；目标图用 area 插值缩放到对应大小。全分辨率分支因此获得最大权重。
+当前只有三个输出尺度：$256$、$128$、$64$。目标图用 area 插值缩放到对应大小。损失权重在训练中
+从 $[1.0,0.5,0.25]$ 平滑退火到 $[1.0,0.1,0.05]$：前期让中间层容易获得梯度，后期把容量集中到
+真正用于提交的全分辨率输出。
 
 \subsection{当前实际模型规模}
 
-工作区没有已经完成训练的 \code{model_stats.json}，所以本文使用项目自带统计函数，
-在 CPU 上对当前合并配置做了一次无权重训练的结构测量。结果为 16,232,644 个可训练参数和约
-39.160 GMAC/单张 $256\times256$ forward。MAC 是卷积/线性乘加次数估计，不等同于精确耗时；实际速度还受到
-GPU、数据加载、AMP、显存和验证频率影响。
+结构统计区分稳定 v2 对照、已停止的 v3 和当前 v4 候选。v2 为 16,232,644 参数、
+约 39.160 GMAC；v3 为 18,074,199 参数、约 44.11 GMAC；v4 的真实构造结果为
+29,130,894 参数、约 75.997 GMAC/单张 $256\times256$ forward。
+MAC 只统计可计数卷积/线性运算，不完整包含 FFT、SDPA attention matmul、SSIM、JPEG 解码、15\% batch 的第二次 D4 forward/backward
+或九张邻域图像的 I/O，因此不能直接换算成小时数。
 
 \begin{table}[H]
 \centering
-\caption{当前单逻辑通道 MultiMarkerRestorer 的顶层参数量}
-\begin{tabular}{lrr}
+\caption{稳定对照、v3 与 v4 候选的结构规模}
+\begin{tabular}{lrrr}
 \toprule
-模块 & 参数量 & 约占总参数 \\
+配置 & 参数量 & 约 GMAC/图 & 状态 \\
 \midrule
-四个 NAF encoder stages & 13,279,616 & 81.808\% \\
-三个 downsample convolutions & 689,024 & 4.245\% \\
-shared/task prototype mixer & 532,993 & 3.283\% \\
-三层 shared decoder & 1,578,752 & 9.726\% \\
-CD68 task adapters & 150,528 & 0.927\% \\
-stem、task embedding 与三个 output heads & 1,731 & 0.011\% \\
-\midrule
-合计 & 16,232,644 & 100\% \\
+retrain-v2 稳定对照 & 16,232,644 & 39.160 & 已完成训练/验证 \\
+max-v3 已停止候选 & 18,074,199 & 44.11 & 用于结构对照 \\
+其中轻量 Detail U & 72,016 & 0.589 & v3 已启用 \\
+max-v4 当前候选 & 29,130,894 & 75.997 & 工程 smoke 通过，待 4090 训练 \\
+其中 Heavy Omni U & 4,509,672 & 包含于 v4 & v4 已启用 \\
+多尺度+三路融合 & 6,453,341 & 包含于 v4 & v4 已启用 \\
 \bottomrule
 \end{tabular}
 \label{tab:model-params}
 \end{table}
 
-\important{当前默认\textbf{启用} shared/task prototypes 与 CD68 task adapters；默认关闭 3$\times$3 ROI
-context、context cross-attention 和 base/detail。源码中另有 CAMP-VS v2、Restormer-lite、hierarchical
-prototypes、organ adapter、calibrator 与 MoE 等可选实现，但 \code{model.name=multi_marker_restorer}
-时不会调用它们。报告描述当前主线时不把“文件存在”算作“前向路径已启用”。}
+\important{v4 当前\textbf{启用} Sobel、NAF、Heavy Omni U、adaptive spatial/frequency、四尺度 gate、
+$1/8$ tri-path SDPA、verified $3\times3$ ROI context、9-token cross-attention、shared/task prototypes、CD68 adapters 和 residual base/detail。
+故意关闭的模块包括与单目标不相容的 FAMO/correlation、与零配准偏移冲突的 shift-tolerant loss、
+没有正收益证据的 foreground loss，以及会显著扩大时间/依赖风险的完整 Mamba、扩散和 GAN。这里的
+“全开”指所有与单目标、已对齐、9 小时预算相容的候选模块，而不是机械打开互相冲突的开关。}
 
 \section{数据流向详解}
 
@@ -1104,9 +1271,9 @@ prototypes、organ adapter、calibrator 与 MoE 等可选实现，但 \code{mode
 \midrule
 图像解码 & DAPI/CD68 JPG & \path{utils/image_io.py} 的 \path{load_image_tensor()} & RGB uint8 HWC 的三个相同通道先取均值并四舍五入，变为 $[0,1]$ 的单通道 float32 CHW。\\
 样本组装 & manifest 一行 & \path{data/dataset.py} 的 \path{VirtualStainingDataset.__getitem__()} & 返回 \path{batch["input"]}、\path{batch["targets"]["CD68"]} 和 ROI/stem 元数据。\\
-选择模型 & 合并后的 YAML & \path{cli.py} 的 \path{_build_model()} & 当 \path{model.name=multi_marker_restorer} 时实例化 \path{MultiMarkerRestorer}，不会同时运行 CAMP-VS v2 或 U-Net。\\
-前向传播 & $B\times1\times256\times256$ DAPI & \path{models/multi_marker_restorer.py} 的 \path{MultiMarkerRestorer.forward()} & NAF 编码、原型混合、task-adapted 解码后返回 \path{RestorationOutput.predictions["CD68"]}。\\
-训练比较 & 预测图与 CD68 真值 & \path{losses/composite.py} 和 \path{engine/trainer.py} & 固定权重复合损失、反向传播并更新参数；CD68 真值只走监督分支，不作为模型输入。\\
+选择模型 & 合并后的 YAML & \path{cli.py} 的 \path{_build_model()} & 当 \path{model.name=multi_marker_restorer} 时实例化当前 v4 \path{MultiMarkerRestorer}；不会另外实例化 CAMP-VS v2 或独立 Residual U-Net。\\
+前向传播 & $B\times1\times256\times256$ DAPI 与 9 个 context tiles & \path{models/multi_marker_restorer.py} 的 \path{MultiMarkerRestorer.forward()} & NAF、Heavy U、自适应 FFT 分别提取特征，经四尺度门控、低分辨率 SDPA、context、原型与 task-adapted 解码后返回 \path{RestorationOutput.predictions["CD68"]}。\\
+训练比较 & 预测图与 CD68 真值 & \path{losses/scheduled_composite.py}、\path{losses/competition_proxy.py} 和 \path{engine/trainer.py} & 两阶段重建/结构损失、深监督退火、后段 float metric proxy 与可选 D4 等变约束；CD68 真值只走监督分支，不作为模型输入。\\
 推理保存 & test DAPI 与 checkpoint & \path{engine/inferencer.py}、\path{submission/writer.py} & 预测先保存为 \path{<stem>.jpg}，提交构建时命名为 \path{<stem>_fake.jpg} 并写入 ZIP。\\
 \bottomrule
 \end{tabularx}
@@ -1134,16 +1301,16 @@ prototypes、organ adapter、calibrator 与 MoE 等可选实现，但 \code{mode
   arr/.style={-{Latex[length=2mm]},thick}
 ]
 \node[cpu] (jpg) {DAPI/CD68 JPG\\manifest 路径};
-\node[cpu,right=of jpg] (workers) {主进程读取\\PIL 解码};
+\node[cpu,right=of jpg] (workers) {8 workers 并发\\PIL 解码};
 \node[cpu,right=of workers] (tensor) {1 通道 CHW float32\\归一化到 $[0,1]$};
 \node[cpu,right=of tensor] (aug) {成对几何增强\\DAPI 强度增强};
-\node[cpu,right=of aug] (pin) {batch + pin memory\\$[8,1,256,256]$};
+\node[cpu,right=of aug] (pin) {batch + pin memory\\{\scriptsize $[12,1,256,256]$}};
 \draw[arr] (jpg)--(workers)--(tensor)--(aug)--(pin);
 
 \node[gpu,below right=15mm and -15mm of jpg] (copy) {non-blocking H2D\\channels\_last};
 \node[gpu,right=of copy] (model) {MultiMarker\\Restorer forward};
-\node[loss,right=of model] (criterion) {固定权重复合损失\\主输出+深监督};
-\node[gpu,right=of criterion] (back) {autograd backward\\梯度累积};
+\node[loss,right=of model] (criterion) {调度复合损失\\主输出+深监督};
+\node[gpu,right=of criterion] (back) {autograd backward\\可选 D4 一致性};
 \node[gpu,right=of back] (step) {AdamW step\\clip + EMA};
 \draw[arr] (pin)--(copy); \draw[arr] (copy)--(model)--(criterion)--(back)--(step);
 \draw[arr,dashed] (step) to[bend right=28] (model);
@@ -1155,14 +1322,14 @@ prototypes、organ adapter、calibrator 与 MoE 等可选实现，但 \code{mode
 进一步拆解如下：
 
 \begin{enumerate}
-  \item 当前有效 \code{num_workers=0}，所以训练主进程按 manifest 读取配对 JPG，PIL 解码为 RGB uint8；这不是 8 个 worker 并发读取。
+  \item AutoDL v4 默认由 8 个 persistent workers 按 manifest 预取配对 JPG，PIL 解码为 RGB uint8；Windows 可显式覆盖为 0。
   \item \code{load_image_tensor()} 对三个相同 RGB 通道取均值并四舍五入为一个逻辑通道，再转为 CHW float32 并除以 255。
   \item PairedTransform 同步改变 DAPI/CD68 的几何，仅扰动 DAPI 强度。
-  \item DataLoader 把 8 个样本堆成 batch，页锁定内存为 CPU 到 GPU 传输做准备。
+  \item DataLoader 把 6 个样本堆成物理 batch；每累积 2 个 batch 才更新一次参数，所以 effective batch 仍为 12。页锁定内存为 CPU 到 GPU 传输做准备。
   \item \code{move_to_device()} 对张量使用 non-blocking CUDA copy；训练器在启用时把 4D 浮点输入转为 channels-last 物理布局。
   \item autocast 选择 BF16 或 FP16 执行适合低精度的算子；模型返回结构化预测结果。
-  \item \code{CompositeRestorationLoss} 将预测与 CD68 真值比较，并把 256/128/64 三个分辨率的固定权重损失合并。
-  \item loss 除以累积因子后反向传播。每两个 DataLoader batch 执行一次优化器更新、梯度清零和 EMA 更新。
+  \item scheduled composite loss 将预测与 CD68 真值比较，连续调度均方误差、稳健像素误差和 SSIM 等权重，并把 256/128/64 三个分辨率的退火深监督合并；后段再加入小权重 float metric proxy。
+  \item 正常每个 DataLoader batch 执行一次反向传播、梯度累积、优化器更新和 EMA 更新；v4 的 15\% batch 另计算一次随机 D4 等变一致性。CUDA OOM 时只在 batch 内切 chunk，不改变有效 batch。
 \end{enumerate}
 
 \subsection{验证数据流}
@@ -1222,14 +1389,14 @@ optimize false 编码一次 JPEG，先保存为 \code{predictions/CD68/<stem>.jp
 
 \subsection{epoch 与 batch：把“看很多遍数据”说清楚}
 
-\term{epoch}{轮次}表示把当前训练集完整遍历一次。当前有 5004 个训练 patch，batch size 为 8，
-DataLoader 不丢弃最后不足 8 张的 batch，因此每个 epoch 大约有
+\term{epoch}{轮次}表示把当前训练集完整遍历一次。当前有 5004 个训练 patch，v4 物理 batch size 为 6，
+DataLoader 不丢弃最后不足 6 张的 batch，因此每个 epoch 大约有
 
 \begin{equation}
-  \left\lceil\frac{5004}{8}\right\rceil=626
+  \left\lceil\frac{5004}{6}\right\rceil=834
 \end{equation}
 
-个 batch。当前配置训练 120 epoch，不代表“只看 120 张图”，而是反复遍历数据 120 次，并且每次都可能
+个 batch。当前配置最多训练 100 epoch，不代表“只看 100 张图”，而是反复遍历数据 100 次，并且每次都可能
 得到新的随机增强。
 
 \code{Trainer.fit()} 是外层 epoch 循环，\code{train_epoch()} 是内层 batch 循环。每个 epoch 开始时模型
@@ -1251,36 +1418,37 @@ OOM 次数和损失分量。
 
 \subsection{梯度累积与 effective batch}
 
-当前 \code{batch_size=8}、\code{gradient_accumulation=2}。每个 micro-batch 都做 forward/backward，但
-连续两个 batch 的梯度先加在一起，再更新一次参数，因此正常情况下
+当前 \code{batch_size=6}、\code{gradient_accumulation=2}，所以正常情况下
 
 \begin{equation}
-  B_{\mathrm{effective}}=8\times2=16.
+  B_{\mathrm{effective}}=6\times2=12.
 \end{equation}
 
-这并不等价于一次把 16 张图同时放进显存：它用更多计算步骤换取较小显存峰值。每个 epoch 正常约有
-$626/2=313$ 次 optimizer step，EMA 也大约更新 313 次。
+每个 epoch 正常约有 834 个 DataLoader batch、417 次 optimizer step，EMA 也大约更新 417 次。若 24 GiB 4090 发生明确 CUDA OOM，
+训练器会把同一个 DataLoader batch 内部分成 3+3 等 chunk；各 chunk 的梯度按真实样本数占原 batch 的比例缩放后再做一次
+optimizer step，所以有效 batch 仍是 12，不会因为降级偷偷变成 24。
 
 \subsection{AMP 混合精度}
 
 \term{AMP}{Automatic Mixed Precision，自动混合精度}让卷积和矩阵乘等适合的算子使用 BF16/FP16，
 对需要稳定范围的算子保留 float32。这样通常可以减少显存并利用 Tensor Core 加速\cite{pytorch_amp}。
 
-当前 \code{amp=true}、\code{amp_dtype=auto}。CUDA GPU 支持 BF16 时选择 \code{torch.bfloat16}，否则
-选择 FP16。GradScaler 只在 CUDA+FP16 时启用；BF16 的指数范围较大，代码不启用 scaler。SSIM、FFT、
+当前 v4 显式设置 \code{amp=true}、\code{amp_dtype=bfloat16}，面向 RTX 4090/5090 使用 BF16 Tensor Core。
+GradScaler 只在 CUDA+FP16 时启用；BF16 的指数范围较大，代码不启用 scaler。SSIM、FFT、
 Sobel gradient 和 prototype cosine 等敏感计算会显式升到 float32，这说明“开 AMP”不是把每个数都粗暴降精度。
 
 \subsection{AdamW、学习率、warmup 与梯度裁剪}
 
-当前优化器是 AdamW，初始学习率 $2\times10^{-4}$，weight decay $10^{-4}$。AdamW 将 weight decay
-与自适应梯度更新解耦\cite{adamw,pytorch_adamw}。前 5 个 epoch 是 warmup，学习率从较小倍数逐步升到
-基础值；之后使用余弦函数下降：
+当前优化器是 AdamW，初始学习率 $1.8\times10^{-4}$，weight decay $10^{-4}$。AdamW 将 weight decay
+与自适应梯度更新解耦\cite{adamw,pytorch_adamw}。前 4 个 epoch 是 warmup，学习率从较小倍数逐步升到
+基础值；之后使用余弦函数下降。v4 还把 bias、normalization、NAF beta/gamma 和 residual scale 放入
+no-decay 参数组；CUDA 支持时使用 fused AdamW，不支持则自动回退普通 AdamW：
 
 \begin{equation}
   \eta(p)=\eta_0\frac{1+\cos(\pi p)}{2},\qquad p\in[0,1].
 \end{equation}
 
-warmup 像汽车起步时缓慢踩油门，避免随机初始化阶段更新过猛。每次 optimizer step 前，所有优化参数的
+前 4 个 epoch 的 warmup 像汽车起步时缓慢踩油门，避免随机初始化阶段更新过猛。每次 optimizer step 前，所有优化参数的
 梯度总范数被裁剪到 1.0，防止个别 batch 产生异常大的更新。
 
 \subsection{EMA：不是另一个独立模型}
@@ -1297,9 +1465,9 @@ warmup 像汽车起步时缓慢踩油门，避免随机初始化阶段更新过�
 而不是先验认定 EMA 一定更优。选中来源会写入 checkpoint 的 extra 元数据，提交时
 \code{weight_source=best_jpg} 会读取它。
 
-\subsection{当前固定权重复合损失}
+\subsection{稳定 v2 对照的固定权重复合损失}
 
-只用像素误差可能得到模糊结果，只用结构指标又可能忽略强度与数值误差。当前配置的
+只用像素误差可能得到模糊结果，只用结构指标又可能忽略强度与数值误差。稳定 v2 对照的
 \code{loss.schedule=constant}，所以 \code{_build_loss()} 构造 \code{CompositeRestorationLoss}，
 不会调用 two-phase 的 \code{ScheduledCompositeLoss}。每个输出尺度组合五项重建损失：
 
@@ -1317,7 +1485,7 @@ Charbonnier 是平滑的 L1 近似，gradient 强调边缘，frequency 比较 FF
 
 \begin{table}[H]
 \centering
-\caption{当前固定损失的重建项权重}
+\caption{稳定 v2 对照的固定损失重建项权重}
 \begin{tabular}{lrp{0.54\textwidth}}
 \toprule
 分量 & 权重 & 直观作用 \\
@@ -1346,6 +1514,29 @@ prototype activation 与 diversity 两项则\textbf{真实启用}，权重各为
   +0.001\mathcal L_{\mathrm{proto\text{-}div}}.
 \end{equation}
 
+\subsection{v3/v4 两阶段损失、指标对齐与 D4 等变}
+
+v3 引入、v4 继承 \code{ScheduledCompositeLoss}。训练进度 $p\in[0,1]$ 从 phase A 平滑过渡到 phase B：前者
+以 Charbonnier 和多尺度结构为主，后者提高 MSE/SSIM 对最终像素指标的约束，并以小权重加入
+Laplacian pyramid、gradient、statistics 与 log-frequency。连续 cosine 插值避免在阶段边界突然改变
+梯度方向。三个深监督权重也按同一进度从 $[1,0.5,0.25]$ 退火到 $[1,0.1,0.05]$。
+
+从训练后 55\% 开始，最终 $256\times256$ 输出还加入权重上限 0.06 的 float-domain metric proxy。
+它用与 scikit-image float SSIM 一致的 uniform $7\times7$、sample covariance 和 valid crop，并按每图
+MSE 计算 capped PSNR loss。它\textbf{不模拟} uint8 round 或 JPEG 编解码；真正 checkpoint 选择仍以
+非可微的 JPG round-trip 验证为准，不能把这项 loss 称为“可微 JPEG”。
+
+训练进度超过 10\% 后，D4 consistency 权重平滑升至 0.015；v4 在 15\% 的 batch 随机抽取一个非恒等 D4 变换，
+同步旋转/翻转中心图、九张 context tiles、valid mask 和二维 offsets，再最小化
+
+\begin{equation}
+  \mathcal L_{\mathrm{eq}}=
+  \operatorname{SmoothL1}\left(T^{-1}f(Tx),\operatorname{stopgrad}(f(x))\right).
+\end{equation}
+
+这会平均增加约 15\% batch 的额外 forward/backward，但不增加推理参数。末段 hard-mix sampler 只在最后
+22\% epoch 把 30\% 槽位温和分给最高 activity 桶；总采样数不变，test 永远不参与训练。
+
 \subsection{channels-last、cuDNN benchmark 与 float32 matmul precision}
 
 当前配置为 CUDA 训练启用 channels-last。逻辑张量形状仍写成 NCHW，但物理内存更接近 NHWC 排列，
@@ -1361,32 +1552,36 @@ GPU 都获得相同比例加速的魔法开关。
 
 \begin{itemize}
   \item \code{progress_bar=auto}：仅在交互式终端的 stderr 是 TTY 时显示 tqdm batch 进度，内容包括 loss、图/秒、学习率和峰值显存；nohup 重定向时默认关闭，避免日志被刷新字符污染。
-  \item \code{async_metric_logging=false}：源码实现了把 loss 分量留在 GPU、epoch 末统一同步的异步缓冲，但当前配置明确关闭，仍采用每 micro-batch 转 Python float 的兼容路径。不能把“已实现”写成“当前已启用”。
+  \item \code{async_metric_logging=true}：loss 分量留在 GPU 累积，epoch 末统一同步，避免每个 batch 因转 Python float 让 GPU 等待 CPU。
+  \item 验证按 pass 输出静态进度：训练期 raw/EMA 分别标为 \code{pass=1/2}、\code{pass=2/2}；训练后的普通与 D4 验证也会打印开始、完成、样本数和耗时，不会在长时间 JPG round-trip 中完全沉默。
+  \item \code{gpu_monitor.enabled=true}：后台每 2 秒调用一次 \code{nvidia-smi}，把 GPU utilization、显存、功耗和温度的 mean/p95/max 汇总进 epoch 日志；监控失败只丢诊断，不中断训练。
   \item \code{profiler.enabled=false}：可选 profiler 能跟踪最初若干 batch 并导出 Chrome trace，但当前生产训练不承担这项开销。
   \item \code{compile.enabled=false}：可选 \code{torch.compile} 失败会回退 eager；当前配置没有启用，也不存在“已经通过 compile 加速”的结果。
 \end{itemize}
 
 \subsection{OOM 恢复}
 
-只有错误明确属于 CUDA out-of-memory 时才进入恢复：清梯度、清缓存，把 batch 在内部切成更小 chunk，
-同时 microbatch factor 和梯度累积倍增。最多三次；chunk 已经为 1 仍 OOM 时抛出错误。这样能保留近似
-effective batch，又不会把文件损坏、shape 错误等普通 bug 伪装成显存问题。虽然 YAML 有
+只有错误明确属于 CUDA out-of-memory 时才进入恢复：清梯度、清缓存，把同一个 DataLoader batch 在内部
+切成更小 chunk。\textbf{配置的 gradient accumulation 不再倍增}；若 OOM 清除了一个尚未完成的累积窗口，
+窗口计数会从重试成功的 batch 重新开始。最多三次；chunk 已经为 1 仍 OOM 时抛出错误。这样能保持原有效
+batch，又不会把文件损坏、shape 错误等普通 bug 伪装成显存问题。虽然 YAML 有
 \code{max_oom_retries=3}，当前 Trainer 实现实际把“三次”直接写在判断逻辑中。
 
 \subsection{验证频率、checkpoint 与早停}
 
-当前有效 \code{validate_every_n_epochs=1}，所以每个 epoch 都验证。若以后显式把间隔改大，最后一个
+v4 有效 \code{validate_every_n_epochs=5}，所以每 5 个 epoch 验证一次；最后一个
 epoch 仍会强制验证；跳过验证的 epoch 只更新 \code{last.ckpt}，不会冒充 best 或 top-k。
 
 每个 epoch 原子写入 \code{last.ckpt}。验证指标创新高时分别写
-\code{best_ssim.ckpt}、\code{best_psnr.ckpt}、\code{best_proxy.ckpt}。当前 \code{save_top_k=1}，所以按
-SSIM、PSNR 排序的 top-k 目录只保留一份候选。
+\code{best_ssim.ckpt} 与 \code{best_proxy.ckpt}。当前 \code{save_top_k=0}，不额外保留重复 top-k 大文件。
 checkpoint 版本 2 包含模型、EMA、优化器、scheduler、scaler、loss 状态、epoch、global step、完整配置、
 manifest hash、ImageSpec、目标列表、指标历史、随机数状态和 DataLoader generator 状态，因此 resume
 不是“只加载一份权重重新开始”。
 
-early-stopping patience 为 30，计数单位是\textbf{实际验证事件}。由于当前每轮都验证，若连续 30 个
-验证 epoch 的 SSIM 没有改进，早停可以在 120 epoch 预算结束前触发。
+early-stopping patience 为 5，计数单位是\textbf{实际验证事件}；即连续 5 次三域验证（最多覆盖 25 个 epoch）没有改进时可以提前停止。停止时日志、history 与摘要都会写入 \code{stop_reason=early_stopping}、当前/最佳指标和未提升次数，不再让用户猜测为何没有跑到 100。
+此外，\code{max_wall_time_hours=8.5} 使用最近 epoch 耗时预测到下一个安全验证点，只在已验证且
+best/last checkpoint 完整写入后停止。它是训练阶段的预测保护，不是操作系统硬截止；数据审计与最终 D4
+仍要另留时间，所以报告只给出 4090 整条命令目标约 9 小时的预算估计，不冒充实测。
 
 \section{验证详解}
 
@@ -1395,9 +1590,10 @@ early-stopping patience 为 30，计数单位是\textbf{实际验证事件}。�
 训练需要随机增强、梯度和 optimizer；验证不增强、不建梯度、不开 optimizer。验证数据按 ROI 与训练集
 隔离，因此分数衡量的是模型对未见 ROI 的泛化，而不是对训练样本的记忆。
 
-截至源码核对时，当前工作区没有可供引用的完整初赛训练 checkpoint、验证 metrics 或 AutoDL 正式日志。
-因此本报告说明“代码如何计算和选择指标”，但不填写任何虚构 SSIM/PSNR，也不声称模型已经达到某个
-排行榜分数。实际数字必须由附录中的训练与验证命令真实生成。
+稳定 retrain-v2 的 AutoDL 日志已经提供完整 1292 张 val 证据：EMA 无 TTA 的 JPG SSIM/PSNR 为
+0.804480/25.97599，EMA+D4 为 0.809280/26.19677；整条命令耗时 3 小时 25 分，训练部分 2 小时 45 分，
+峰值显存 11.63 GiB。v4 尚未在 4090/5090 上完成正式训练，因此这些数字只能作为固定对照，不能写成 v4 已涨分，
+更不能伪造平台 test 指标。v4 的实际数字必须由附录中的命令真实生成。
 
 \subsection{SSIM 与 PSNR}
 
@@ -1483,13 +1679,15 @@ test 只有 DAPI，没有 CD68 真值。SSIM/PSNR 都属于 full-reference metri
 
 \subsection{D4、权重来源与 JPEG 保存}
 
-当前推理配置为 \code{use_ema=false}、\code{weight_source=best_jpg}、\code{tta=d4}、
-\code{tta\_policy=configured}。其中
-\code{best_jpg} 优先使用 checkpoint 记录的训练期 raw/EMA 胜者；如果旧 checkpoint 没有记录，才根据
+当前推理使用以下四项设置：\path{use_ema=false}、\path{weight_source=best_jpg}、\path{tta=d4}，
+以及 \path{tta_policy=configured}。其中 \path{best_jpg} 优先使用 checkpoint 记录的训练期
+raw/EMA 胜者；如果旧 checkpoint 没有记录，才根据
 \code{use_ema=false} 回退到 raw，且 checkpoint 没有 EMA 时也会安全使用 raw。本次 seed-2026 checkpoint
 的训练期胜者是 EMA。完整 1292 张验证集上，D4 把 JPG SSIM 从 0.804480 提高到 0.809280，PSNR 从
 25.97599 dB 提高到 26.19677 dB，且 5 个 ROI 的聚合变化均为正，因此正式提交默认执行八次 forward。
-训练阶段仍不执行 D4；它只增加预测时间，不减少训练 epoch，也不会改变已训练的模型参数。
+这里的“提交 D4”与训练期的“D4 等变一致性”不是同一件事：前者对每张 test 图执行八次前向并平均，
+后者在 v4 的 15\% 训练 batch 上追加一次随机变换的一致性约束。提交 D4 不会改变 checkpoint 参数，但训练期
+一致性会参与梯度更新。
 
 预测 tensor 先 clamp、乘 255、四舍五入为 uint8，按目标 ImageSpec 保存。当前目标审计为 RGB，所以
 最终模式应为 RGB，而不是 L。
@@ -1499,7 +1697,7 @@ test 只有 DAPI，没有 CD68 真值。SSIM/PSNR 都属于 full-reference metri
 构建后的真实结构是：
 
 \begin{lstlisting}[style=shell]
-outputs/initial_round/<run-id>/submission/
+outputs/initial_round_max_v4/<run-id>/submission/
 |-- results/
 |   `-- test/
 |       `-- CD68/
@@ -1537,15 +1735,17 @@ YAML 是一种供人阅读的层级配置格式。它把“经常调整的参数
 
 \begin{lstlisting}[style=yaml]
 train:
-  epochs: 120
-  batch_size: 8
+  epochs: 100
+  batch_size: 6
+  gradient_accumulation: 2
 model:
   context:
-    enabled: false
+    enabled: true
 \end{lstlisting}
 
 缩进表示所属关系，不能随意混用 Tab。这里 
-\code{train.epochs} 表示训练轮数，\path{model.context.enabled=false} 表示不启用邻域上下文。
+\path{train.epochs} 表示最大训练轮数，\path{model.context.enabled=true} 表示请求启用邻域上下文；
+v4 还要求 \path{require_verified_grid=true}，审计失败时不会静默猜邻居。
 布尔量应写成 \code{true/false}，列表可以写成 \code{[64, 128, 256, 512]}。
 
 \subsection{配置合并优先级}
@@ -1554,7 +1754,7 @@ model:
 
 \begin{enumerate}
   \item \code{configs/default.yaml}：所有实验共享的默认值；
-  \item 用户指定的 YAML，例如 \code{configs/initial_round_cd68.yaml}；
+  \item 用户指定的 YAML，例如 \code{configs/initial_round_cd68_max_v4.yaml}；
   \item \code{configs/resolved_local.yaml}：当前文件存在，保存本地审计推导出的数据根、逻辑通道和 worker 设置；
   \item CLI 的 \code{--set key=value}：只覆盖这一次命令，优先级最高。
 \end{enumerate}
@@ -1566,21 +1766,20 @@ model:
 python -m virtual_staining.cli \
   --log-root log \
   autodl-run \
-  --config configs/initial_round_cd68.yaml \
-  --run-id cd68_quickcheck \
-  --max-epochs 3 \
-  --skip-submission
+  --config configs/initial_round_cd68_max_v4.yaml \
+  --run-id cd68_max_v4_quickcheck \
+  --max-epochs 3
 \end{lstlisting}
 
 \important{\code{--max-epochs 3} 是快速检查，不是正式训练。必须换一个新的 run ID，避免把快速实验和
-120 epoch 的正式实验混在一起。}
+100 epoch 的正式实验混在一起。}
 
 \subsection{当前初赛配置逐项说明}
 
 表~\ref{tab:current-config} 汇总当前真正影响初赛 CD68 训练的主要设置。
 
 \begin{longtable}{p{0.28\textwidth}p{0.18\textwidth}p{0.45\textwidth}}
-\caption{\texttt{initial\_round\_cd68.yaml} 的关键生效配置}\label{tab:current-config}\\
+\caption{\texttt{initial\_round\_cd68\_max\_v4.yaml} 的关键生效配置}\label{tab:current-config}\\
 \toprule
 配置项 & 当前值 & 含义与影响 \\
 \midrule
@@ -1589,27 +1788,29 @@ python -m virtual_staining.cli \
 配置项 & 当前值 & 含义与影响 \\
 \midrule
 \endhead
-\code{data.root} & dataset/official & 由 resolved-local 配置锁定当前官方数据根。\\
+\code{data.root} & AUTO $\rightarrow$ dataset/official & 自动发现官方 train/test；resolved-local 仍可覆盖。\\
 \code{data.targets} & CD68 & 当前训练只学习 DAPI 到 CD68。\\
-\code{data.num_workers} & 0 & resolved-local 的值优先于初赛 YAML 中的 8；当前由训练主进程同步读取。\\
+\code{data.num_workers} & 8 & AutoDL 使用 8 个 persistent workers、prefetch 4；Windows 本地可覆盖为 0。\\
 logical channels & 1 入 / 1 出 & RGB 文件内容按审计结论压成一个逻辑灰度通道，提交时再恢复 RGB storage。\\
-\code{model.name} & \shortstack{multi\_marker\_\\restorer} & 使用四尺度 NAF、prototype 和 task adapter 主线。\\
+\code{model.name} & \shortstack{multi\_marker\_\\restorer} & 使用四尺度 NAF 主干及 v4 重型三路融合。\\
 channels/depths & [64,128,256,512] / [2,2,4,6] & 控制四级 NAF encoder 容量；stem 保持全分辨率。\\
-global mixer & 未启用 & 当前不运行 Restormer-lite；瓶颈运行 cosine prototype mixer。\\
-context & 关闭 & 当前训练不读取 $3\times3$ 邻居，避免未经验证坐标造成泄漏。\\
+heavy U & [56,88,128,176] & 四尺度完整编解码，局部/轴向大核/空洞卷积，编码深度 [3,4,6,6]。\\
+spatial/frequency & 自适应开启 & $1/8$ 根据 patch 学习 FFT low/high 分界与双向调制。\\
+multi-route fusion & 四尺度开启 & 高分辨率 NAF/Heavy 门控；$1/8$ NAF/Heavy/frequency softmax + 2 SDPA。\\
+context & verified $3\times3$ & tiny shared encoder；$1/4,1/8$ FiLM 与 9-token cross-attention。\\
 prototypes & 开启，8 shared + 8 task & 在 $32\times32$ 瓶颈执行余弦注意力与残差融合。\\
 task adapters & 开启 & 每个解码尺度使用 CD68 embedding 与零初始化 FiLM/residual adapter。\\
-base/detail / calibrator & 关闭 / 未实例化 & 当前 output head 直接 $1\times1$ 卷积后 sigmoid。\\
-loss schedule & constant & 使用固定权重 CompositeRestorationLoss，不运行 two-phase schedule。\\
-\code{train.epochs} & 120 & 完整训练轮数。\\
-batch / accumulation & 8 / 2 & 正常情况下有效 batch size 为 $8\times2=16$。\\
-optimizer & AdamW & 初始学习率 $2\times10^{-4}$，权重衰减 $10^{-4}$。\\
-scheduler & warmup+cosine & 前 5 epoch 预热，随后余弦衰减。\\
-AMP & auto & 支持时优先 BF16，否则 FP16；FP16 才使用 GradScaler。\\
-EMA & 0.999 & 每个 optimizer step 更新滑动平均权重；验证仍会与 raw 公平比较。\\
-validation interval & 1 epoch & 每个 epoch 跑 float、uint8、JPG 三域验证。\\
+base/detail & direct + zero residual & coarse/detail 零初始化叠加旧 direct logits；calibrator 关闭。\\
+loss schedule & two-phase & MSE/Charbonnier/SSIM 等连续调度，深监督退火，末段 float metric proxy。\\
+\code{train.epochs} & 100 & 最大轮数；另有 8.5 小时安全停点预测保护。\\
+batch / accumulation & 6 / 2 & 有效 batch 仍为 12；给重型激活留出 24 GiB 显存余量。\\
+optimizer & grouped fused AdamW & 学习率 $1.8\times10^{-4}$、weight decay $10^{-4}$，bias/norm/residual scale no-decay。\\
+scheduler & warmup+cosine & 前 4 epoch 预热，随后余弦衰减。\\
+AMP & BF16 & RTX 4090 Tensor Core；SSIM/FFT/prototype 等敏感路径升 float32。\\
+EMA & 0.999 & 每个验证点同时比较 raw/EMA，由 JPG 指标选择 checkpoint 来源。\\
+validation interval & 5 epoch & 每五轮跑 float、uint8、JPG 三域；最后一轮强制验证。\\
 primary domain & JPG & best checkpoint 首先依据更接近提交文件的 JPG 域。\\
-inference TTA & none & 当前每图一次 forward；D4 只是可选能力。\\
+inference TTA & D4 configured & 已由稳定对照的全 val/5 ROI 证据确认，提交默认八次变换。\\
 \bottomrule
 \end{longtable}
 
@@ -1618,8 +1819,10 @@ inference TTA & none & 当前每图一次 forward；D4 只是可选能力。\\
 当前配置为 CUDA 训练打开了 \code{channels_last}、cuDNN benchmark，并把 float32 matmul precision
 设为 \code{high}。固定 $256\times256$ 尺寸适合 cuDNN 自动选择卷积算法。训练器和验证器会把模型与输入
 转换为 channels-last 内存格式；当前 inferencer 没有同样的显式转换，因此不能笼统声称“训练、验证、推理
-全流程都使用 NHWC”。\code{torch.compile}、profiler 和异步 metric logging 默认关闭：它们是可实验的
-性能工具，不应在没有 A/B 计时与数值核对时被描述成已经生效。
+全流程都使用 NHWC”。异步 metric logging、fused AdamW 和 GPU monitor 已开启；\code{torch.compile}
+与 profiler 仍关闭，因为前者尚未完成 eager/compiled checkpoint 回归，后者会给正式训练增加诊断开销。
+网络中的“并行”表示局部、频率、邻域多路特征在同一计算图中由 GPU 批量 kernel 执行，不等于手写多个
+CUDA stream；单卡 autograd 强行多 stream 往往会增加同步和显存。
 
 \subsection{当前通道数的一个重要事实}
 
@@ -1633,7 +1836,7 @@ inference TTA & none & 当前每图一次 forward；D4 只是可选能力。\\
 
 \begin{enumerate}
   \item 每次只改变一个主要因素，并使用新的 run ID；
-  \item 先跑 1--3 epoch 检查数据、loss、显存和 checkpoint，再启动 120 epoch；
+  \item 先跑 1--3 epoch 检查数据、loss、显存和 checkpoint，再启动最多 100 epoch 的 v4 正式训练；
   \item 比较模型时固定 manifest、seed、训练预算和验证协议；
   \item 不要根据 test 反复调参，因为 test 没有本地标签；
   \item 不要为了“跑起来”把 val 当 test，也不要在 train/val 间混入同一 ROI；
@@ -1650,17 +1853,18 @@ project/
 |-- dataset/                  # data only; never import it into source code
 |   `-- official/{train,test}
 |-- src/virtual_staining/     # installable Python package
-|-- docs/                     # user guides and this report
+|-- docs/essay/report.tex     # the single editable technical guide/report
 |-- artifacts/                # manifests and data audit artifacts
 |-- outputs/                  # checkpoints, validation and predictions
+|-- output/pdf/               # compiled technical report PDF
 |-- log/                      # compact AutoDL logs and downloadable bundles
 |-- pyproject.toml            # package metadata and Python dependencies
 `-- README.md                 # project entry point for users
 \end{lstlisting}
 
-\important{当前覆盖后的工作区中 \code{tests/} 目录不存在；上面的树因此没有列出它。源码仍可做
-\code{compileall} 和 \code{ruff} 静态检查，但不能把“pytest 无测试可收集”写成“自动化测试通过”。
-若此版本要继续长期开发，应从可信快照恢复与当前接口匹配的测试，而不是凭空声称已有回归保护。}
+\important{按上传精简要求，当前工作区没有 \code{tests/} 目录，\code{.ruff\_cache/} 也已清理；上面的树
+因此不列测试资产。本报告不声称该精简副本通过了 pytest。若此版本继续长期开发，应在独立开发分支恢复
+与当前接口匹配的回归测试，而不是把训练数据、checkpoint 或提交结果当成测试替代品。}
 
 源代码采用 \term{src-layout}{包放在 \code{src/} 下的 Python 工程布局}。运行
 \code{pip install -e .} 后，Python 能从任意工作目录找到 \code{virtual_staining}；\code{-e} 表示 editable，
@@ -1729,11 +1933,15 @@ project/
 \code{task_organ_conditioning.py} & marker/organ embedding 与零初始化 FiLM 条件调制。\\
 \code{context_tile_encoder.py} & 共享参数编码邻居 tile，结合位置 offset 和有效 mask。\\
 \code{context_fusion.py} & 将邻域上下文以残差 FiLM 或瓶颈交叉注意力注入中心特征。\\
+\code{lightweight_detail_unet.py} & 四尺度大核 depthwise/gated 轻量 U 分支，向 $1,1/2,1/4$ skip 注入零初始化细节残差。\\
+\code{heavy_detail_unet.py} & v4 四尺度重型 U 分支；高分辨率使用 depthwise/local gated block，低分辨率组合局部、轴向大核与空洞卷积。\\
+\code{spatial_frequency_mixer.py} & 在 $1/8$ 瓶颈执行 float32 FFT low/high 分解；v4 由当前图像预测受限 cutoff，让低/高频相互调制，并以 route-only 接口避免第三路重复携带 NAF identity。\\
+\code{multi_route_fusion.py} & 对 NAF、重型 U 与频率路线同时计算逐通道/逐空间 softmax gate，并以小残差系数和两层低分辨率 SDPA 注入。\\
 \code{hierarchical_prototypes.py} & 多尺度 shared/marker/organ 原型、用量与 dead-prototype 诊断。\\
 \code{prototype_mixer.py} & 旧版余弦原型匹配核心，供兼容模型和扩展模块复用。\\
-\code{laplacian_decoder.py} & 从低分辨率预测 base、从全分辨率预测 bounded detail，并执行合成。\\
+\code{laplacian_decoder.py} & 预测 coarse/detail，并在 v3/v4 中以零初始化 residual 叠加已验证的 direct logits，避免初始输出突变。\\
 \code{intensity_calibrator.py} & 学习受限的 per-target gain/bias，校正整体强度而避免无界漂移。\\
-\code{multi_marker_restorer.py} & \textbf{当前有效主模型}：四尺度 NAF 编解码、shared/task prototypes、task adapters 与三尺度输出。\\
+\code{multi_marker_restorer.py} & \textbf{当前有效主模型}：四尺度 NAF 编解码、重型 Detail U、自适应频率路线、多尺度三路融合、verified context、shared/task prototypes、task adapters、稳定 base/detail 与三尺度输出。\\
 \code{dapi_mae.py} & 可选 DAPI masked autoencoder 预训练，不使用标签并需 fold-local 防泄漏。\\
 \code{registry.py} & 按配置名构造 Residual U-Net、MultiMarkerRestorer 或 CAMP-VS v2，并统一输出接口。\\
 \code{__init__.py} & 汇总模型子包接口。\\
@@ -1756,6 +1964,7 @@ project/
 \code{losses/frequency.py} & 在 log-frequency 域比较纹理能量。\\
 \code{losses/pyramid.py} & 多尺度 Laplacian/pyramid 重建约束。\\
 \code{losses/statistics.py} & 约束均值、标准差等强度统计。\\
+\code{losses/competition_proxy.py} & 后段训练使用的可微 float SSIM/PSNR 代理；不冒充 uint8/JPEG round-trip。\\
 \code{losses/prototype.py} & prototype activation/diversity 等辅助约束。\\
 \code{losses/shift_tolerant.py} & 可选小位移容忍损失；当前对齐审计为 0，默认关闭。\\
 \code{losses/composite.py} & v1 固定权重复合损失和深监督汇总。\\
@@ -1779,7 +1988,8 @@ project/
 \midrule
 \endhead
 \code{common.py} & 公用 DataLoader、模型/损失/优化器构造和配置辅助逻辑。\\
-\code{trainer.py} & 训练主循环：AMP、累积、裁剪、EMA、OOM 降级、验证、early stopping 和保存。\\
+\code{optim.py} & 构建 no-decay 参数组与 fused AdamW，并记录实际采用的优化器实现。\\
+\code{trainer.py} & 训练主循环：BF16 AMP、D4 一致性、EMA、OOM microbatch、GPU 监控、时间保护、验证、early stopping 和保存。\\
 \code{validator.py} & 三域逐图推理、分组聚合、raw/EMA 比较和验证产物写入。\\
 \code{inferencer.py} & 无标签确定性预测、D4 逆变换、显存降级和 JPEG 输出。\\
 \code{checkpoint.py} & 保存/恢复模型、EMA、optimizer、scheduler、scaler、RNG、manifest/config hash。\\
@@ -1814,6 +2024,7 @@ project/
 \code{submission/validator.py} & 校验数量、命名、mode、尺寸、像素异常、ZIP 路径和 CRC。\\
 \code{submission/__init__.py} & 暴露 submission 公共接口。\\
 \code{utils/device.py} & 发现 CPU/CUDA、显存与 BF16 能力，解析设备和硬件 profile。\\
+\code{utils/gpu_monitor.py} & 周期采样 GPU 利用率、显存、功耗与温度，按 epoch 汇总 mean/p95/max。\\
 \code{utils/image_io.py} & 统一 RGB/L 读取、float/uint8 转换和高质量 JPEG 保存。\\
 \code{utils/logging.py} & 创建 console/file logger、结构化 JSON 日志和运行元数据。\\
 \code{utils/paths.py} & 使用 pathlib 处理中文、空格、相对和绝对路径。\\
@@ -1837,19 +2048,24 @@ project/
 \section{总结：从一张 DAPI 到竞赛 ZIP}
 
 CAMP-VS 把虚拟染色组织成一条可审计而不是“只会跑一个网络”的流水线：先发现数据并把同名 DAPI/CD68
-配成 manifest；严格按 ROI 隔离 train/val；把 RGB storage 转换成单逻辑通道 float tensor；用四尺度 NAF
-编码器提取结构，在 $1/8$ 瓶颈用 shared/task cosine prototypes 混合，在解码端用 CD68 task adapter 恢复
-三尺度预测；用 Charbonnier、SSIM、MS-SSIM、gradient、frequency 与 prototype 正则训练；最后在 float、
-uint8、JPG 三个域验证，选择 raw 或 EMA 权重，以当前无 TTA 配置预测官方 test，并进行严格 ZIP 校验。
+配成 manifest；严格按 ROI 隔离 train/val；把 RGB storage 转换成单逻辑通道 float tensor；当前 v4 用
+四尺度 NAF 主干提取稳定结构，同时由重型 Heavy Omni U-Net 恢复多尺度细胞细节、由自适应 FFT 独立路线
+分解并双向调制 low/high 频率，真实 $3\times3$ DAPI 邻域提供 ROI 上下文。四个尺度使用逐通道与逐空间
+softmax gate 融合，$1/8$ 瓶颈再用两层原生 SDPA、context 和 shared/task cosine prototypes 建立全局语义；
+解码端以 CD68 adapter 和 zero-init base/detail residual 恢复三尺度预测；最后在 float、uint8、JPG 三个域
+验证 raw/EMA，并以配置化 D4 推理官方 test，进行严格 ZIP 校验。
 
 项目当前有三个特别重要的边界。第一，本地 val 有 CD68 真值，所以能够计算 SSIM/PSNR；官方 test 只有
 DAPI，本地不能算分。第二，文件存储为 RGB，但当前模型实际使用 1 输入/1 输出逻辑通道，提交时才恢复
-RGB storage。第三，prototype 与 task adapter 当前确实启用；邻域、Restormer-lite、base/detail、calibrator
-和 organ adapter 等模块虽然有源码，但当前初赛配置没有调用。报告不会把“代码存在”写成“默认已使用”。
+RGB storage。第三，v4 的重型 U、自适应 spatial/frequency、多尺度三路融合、两层低分辨率 SDPA、verified
+context、cross-attention、prototype、task adapter 和 residual base/detail 确实进入 forward；完整
+Restormer/Mamba、diffusion、GAN、calibrator、FAMO 与 shift-tolerant 等替代模块仍关闭。报告不会把“代码存在”
+写成“默认已使用”。
 
-对初学者而言，最重要的实验习惯不是一次堆叠最多模块，而是保证每次比较公平：固定 split、seed、epoch、
-三域验证协议和 JPEG 参数，只改一个因素；保存 effective config、日志和逐图指标；任何提升都先在 ROI-grouped
-val 上重复，再提交平台验证。这样即使一次实验失败，它仍然提供可用证据，而不是变成无法解释的数值。
+对初学者而言，最重要的实验习惯仍是保证比较公平：固定 split、seed、训练预算、三域协议和 JPEG 参数；
+保存 effective config、GPU/模块日志和逐图指标。v4 是“单次重训的候选组合”，不是已证明上涨的结果。
+只有它的 D4 JPG 指标稳定超过固定对照 0.809280/26.19677、各 ROI/活动度/边界分层没有集中退化，且平台
+分数也提高后，才能声称性能升级成功。
 
 \appendix
 
@@ -1893,14 +2109,15 @@ export PYTHONPATH="$PWD/src:$PYTHONPATH"
 
 \begin{lstlisting}[style=shell]
 unset OMP_NUM_THREADS
-export OMP_NUM_THREADS=$(nproc)
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 python -c "import virtual_staining; print('package ok')"
 python -c "import torch; print(torch.__version__, torch.version.cuda); \
 print('cuda=', torch.cuda.is_available()); \
 print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 \end{lstlisting}
 
-若 \code{cuda=False}，不要启动 120 epoch。先解决 PyTorch/CUDA 环境，否则模型会落到 CPU，训练可能从
+若 \code{cuda=False}，不要启动 100 epoch。先解决 PyTorch/CUDA 环境，否则模型会落到 CPU，训练可能从
 数小时变成数天。
 
 \subsection{第 2 步：可选的 3 epoch 流程检查}
@@ -1909,36 +2126,39 @@ print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 
 \begin{lstlisting}[style=shell]
 python -m virtual_staining.cli --log-root log autodl-run \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_max_v4.yaml \
   --data-root AUTO \
   --target CD68 \
-  --run-id cd68_quickcheck \
+  --run-id cd68_max_v4_quickcheck \
   --max-epochs 3
 \end{lstlisting}
 
 终端会显示 tqdm 进度条和 epoch/batch 进度。这个命令会真实读取、审计、训练、保存和验证，但 3 epoch
 结果只证明流程打通。它既不是正式成绩，也不能取代完整训练。
 
-\subsection{第 3 步：120 epoch 正式训练与验证}
+\subsection{第 3 步：v4 正式训练与验证}
 
 使用一个新的、永不复用的 run ID：
 
 \begin{lstlisting}[style=shell]
 python -m virtual_staining.cli --log-root log autodl-run \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_max_v4.yaml \
   --data-root AUTO \
   --target CD68 \
-  --run-id cd68_full_seed2026
+  --run-id cd68_max_v4_seed2026
 \end{lstlisting}
 
-一条命令依次执行环境记录、数据发现、manifest、审计、120 epoch 训练和 best checkpoint 验证。不要关闭
+一条命令依次执行环境记录、数据发现、manifest、ROI 邻域审计、最多 100 epoch 训练、raw/EMA 三域验证和
+最终 D4 验证。v4 每 5 轮验证，15\% batch 执行训练期等变分支，训练阶段有 8.5 小时预测式安全停点。
+基于 v3 远程吞吐与 v4 75.997 GMAC 的工程估算是后段约 4.5--5.2 分钟/轮，整条命令目标 9 小时左右，但尚未在 AutoDL 完整实测。
+不要关闭
 SSH 页面后误以为进程一定继续；若需要断线运行，应在 AutoDL 的 tmux 中执行，或使用平台提供的后台任务。
 
 实时观察 GPU 和日志可另开一个终端：
 
 \begin{lstlisting}[style=shell]
 watch -n 2 nvidia-smi
-tail -f log/cd68_full_seed2026/autodl-run.log
+find log/cd68_max_v4_seed2026 -maxdepth 3 -type f
 \end{lstlisting}
 
 具体日志文件名以该 run 的 \code{log/} 目录实际内容为准；\code{find log -maxdepth 3 -type f} 可列出全部。
@@ -1951,11 +2171,11 @@ tail -f log/cd68_full_seed2026/autodl-run.log
 
 \begin{lstlisting}[style=shell]
 python -c "import json; \
-m=json.load(open('outputs/initial_round/cd68_full_seed2026/validation/metrics.json')); \
-j=m['domains']['jpg']['macro']; \
-print('JPG SSIM =', j['mean_ssim']); \
-print('JPG PSNR =', j['mean_psnr']); \
-print('ROI SSIM =', j.get('roi_ssim'))"
+m=json.load(open('outputs/initial_round_max_v4/cd68_max_v4_seed2026/validation/metrics.json')); \
+j=m['tta_comparison']['d4']['domains']['jpg']['macro']; \
+print('D4 JPG SSIM =', j['mean_ssim']); \
+print('D4 JPG PSNR =', j['mean_psnr']); \
+print('fixed baseline = 0.809280 / 26.19677')"
 \end{lstlisting}
 
 这一步使用 official train 中隔离出的 val：输入和 CD68 真值都存在，因此可以算分。以后改模型时，用相同
@@ -1966,9 +2186,9 @@ ROI 分层确认没有集中退化。它并不等于排行榜一定上升。
 
 \begin{lstlisting}[style=shell]
 python -m virtual_staining.cli --log-root log validate \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_max_v4.yaml \
   --data-root AUTO \
-  --checkpoint outputs/initial_round/cd68_full_seed2026/checkpoints/best_ssim.ckpt
+  --checkpoint outputs/initial_round_max_v4/cd68_max_v4_seed2026/checkpoints/best_ssim.ckpt
 \end{lstlisting}
 
 \subsection{第 5 步：对 test 推理并生成提交包}
@@ -1977,17 +2197,17 @@ python -m virtual_staining.cli --log-root log validate \
 
 \begin{lstlisting}[style=shell]
 python -m virtual_staining.cli --log-root log autodl-submit \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_max_v4.yaml \
   --data-root AUTO \
   --target CD68 \
-  --checkpoint outputs/initial_round/cd68_full_seed2026/checkpoints/best_ssim.ckpt
+  --checkpoint outputs/initial_round_max_v4/cd68_max_v4_seed2026/checkpoints/best_ssim.ckpt
 \end{lstlisting}
 
 也可以不写 checkpoint，让程序在 \code{outputs/**/best_ssim.ckpt} 中按修改时间自动选最新文件：
 
 \begin{lstlisting}[style=shell]
 python -m virtual_staining.cli --log-root log autodl-submit \
-  --config configs/initial_round_cd68.yaml \
+  --config configs/initial_round_cd68_max_v4.yaml \
   --data-root AUTO \
   --target CD68
 \end{lstlisting}
@@ -1999,7 +2219,7 @@ python -m virtual_staining.cli --log-root log autodl-submit \
 test 没有 CD68 真值，因此命令只生成预测并检查格式，不会显示真实 SSIM/PSNR。最终上传：
 
 \begin{lstlisting}[style=shell]
-outputs/initial_round/cd68_full_seed2026/submission/submission_CD68.zip
+outputs/initial_round_max_v4/cd68_max_v4_seed2026/submission/submission_CD68.zip
 \end{lstlisting}
 
 竞赛平台用隐藏标签评分后，返回的才是 official test score。
@@ -2039,8 +2259,8 @@ outputs/initial_round/cd68_full_seed2026/submission/submission_CD68.zip
 \endhead
 \code{No module named virtual_staining} & 确认位于项目根目录，执行 \code{pip install -e . --no-deps}，或正确设置 \code{PYTHONPATH="$PWD/src:$PYTHONPATH"}。\\
 CUDA availability 为 False & 检查租用实例是否有 GPU、驱动、PyTorch CUDA wheel；修好前不要 CPU 硬跑正式训练。\\
-CUDA out of memory & 先关占显存进程；再用 \code{--set train.batch_size=4 --set train.gradient_accumulation=4} 保持有效 batch 约 16。训练器也只针对明确 CUDA OOM 最多降级三次。\\
-进度条似乎不动 & 看 \code{nvidia-smi}、系统内存、日志末尾；数据审计和全量三域验证不是训练 batch，可能暂时没有训练进度条。\\
+CUDA out of memory & 训练器先自动把 v4 物理 batch 6 切成更小 chunk，effective batch 不变；仍失败时用 \code{--set train.batch_size=3 --set train.gradient_accumulation=4} 保持有效 batch 12，再不够才开启 heavy-U activation checkpoint。\\
+进度条似乎不动 & 看 \code{nvidia-smi}、系统内存、日志末尾；数据审计不是训练 batch。验证虽没有逐图 tqdm，但会输出 raw/EMA 或 D4 pass 的开始/完成、样本数和耗时；若连 pass 开始信息也没有，再排查进程。\\
 DataLoader worker 崩溃 & Linux 先减少 \code{data.num_workers}；Windows 本地调试设为 0。检查共享内存、损坏图和 OOM，而非盲目重启。\\
 JPG 指标低于 float & 量化和 JPEG 会损失细节，这是三域评估的目的；确认质量 100、subsampling 0 且没有二次编码。\\
 val 很好、平台分数差 & 检查 ROI 分布差异、过拟合、submission target/命名、raw/EMA/TTA 选择以及本地指标与官方公式差异。\\
@@ -2064,16 +2284,19 @@ run ID 已存在 & 使用新的唯一 run ID；不要覆盖旧 run 后再拿混�
 “训练集 6296 张” & 6296 是每个 marker 的总配对数；当前 manifest 为 5004 train、1292 val。\\
 “测试集可计算 SSIM” & 错。1346 张 test 只有 DAPI，真实标签在平台。\\
 “图像是 L 单通道” & storage 仍为 RGB；resolved-local 让模型实际使用 1 入/1 出逻辑通道，提交时恢复 RGB。\\
-“默认用了 $3\times3$ 邻域” & 错。context 实现存在，初赛配置为 disabled。\\
+“v4 用了 $3\times3$ 邻域” & 对。只接受 filename 坐标和 verified grid；train/val ROI 与邻接边均不重叠。\\
 “默认用了 prototype” & 对。当前启用 8 个 shared 与 8 个 CD68 task prototypes，并有两项 0.001 正则。\\
 “NAF 模型完全没有任何激活” & NAF block 的核心是 activation-free；全模型其他分支仍可包含 GELU 等操作。\\
 “EMA 一定比 raw 好” & 错。每个验证点同时评分，由 JPG 指标选择；短训练 EMA 可能滞后。\\
 “验证只按 YAML domains 列表算一域” & 当前 Validator 实际总是生成 float、uint8、JPG 三域。\\
 “JPG 域等于官方评分” & 它最接近提交文件，但官方公式/隐藏处理不在本地代码中，不能宣称完全一致。\\
 “普通 metrics.json 含 bootstrap CI” & 普通验证有 ROI 聚合；成对 CI 在 promotion/TTA 比较路径生成。\\
-“早停 30 表示固定跑满 120 epoch” & 错。当前每轮都验证；连续 30 个验证事件无 SSIM 改进即可提前停止。\\
+“v4 一定跑满 100 epoch” & 错。每 5 epoch 验证；5 个验证事件无改进或预测将超过 8.5 小时安全停点都可提前停止。\\
 “所有阶段都用了 channels-last” & Trainer/Validator 显式使用；当前 Inferencer 没有同样的显式转换。\\
-“当前模型是 37.35M Transformer” & 错。实际为 16,232,644 参数的 MultiMarkerRestorer；无 Restormer forward，近似 39.160 GMAC。\\
+“v4 是一个完整 Restormer 或 Mamba” & 错。它是 29,130,894 参数、约 75.997 GMAC 的 NAF、重型 U、自适应 FFT 与 context 三路模型；只有 $1/8$ 瓶颈的融合器使用两层原生 SDPA，没有完整 Restormer/Mamba forward。\\
+“base/detail 会随机替换旧输出头” & v3/v4 都不会。direct logits 保留，coarse/detail 只作为零初始化 residual，初始 prediction 与 direct head 逐位一致。\\
+“训练 loss 里的 metric proxy 等于 JPG” & 错。它只对齐 float SSIM/PSNR；uint8/JPEG round-trip 只在验证阶段真实执行。\\
+“OOM 后 accumulation 会自动翻倍” & 错。v4 只切分同一 DataLoader batch，并在必要时重启累积窗口，保持配置 effective batch。\\
 \bottomrule
 \end{longtable}
 
@@ -2157,6 +2380,42 @@ J. C. Waters,
 ``Accuracy and precision in quantitative fluorescence microscopy,''
 \emph{Journal of Cell Biology}, vol. 185, no. 7, pp. 1135--1148, 2009.
 \url{https://pmc.ncbi.nlm.nih.gov/articles/PMC2712964/}
+
+\bibitem{convir}
+Y. Cui et al.,
+``Revitalizing Convolutional Network for Image Restoration,''
+\emph{IEEE Transactions on Pattern Analysis and Machine Intelligence}, 2024.
+\url{https://github.com/c-yn/ConvIR}
+
+\bibitem{darkir}
+G. Feijoo et al.,
+``DarkIR: Robust Low-Light Image Restoration,''
+\emph{IEEE/CVF Conference on Computer Vision and Pattern Recognition}, 2025.
+\url{https://github.com/cidautai/DarkIR}
+
+\bibitem{esc}
+D. Lee et al.,
+``ESC: Emulating Self-Attention with Convolution for Efficient Image Super-Resolution,''
+\emph{IEEE/CVF International Conference on Computer Vision}, 2025.
+\url{https://github.com/dslisleedh/ESC}
+
+\bibitem{oknet}
+Y. Cui et al.,
+``Omni-Kernel Network for Image Restoration,''
+\emph{AAAI Conference on Artificial Intelligence}, 2024.
+\url{https://github.com/c-yn/OKNet}
+
+\bibitem{adair}
+Y. Cui et al.,
+``AdaIR: Adaptive All-in-One Image Restoration via Frequency Mining and Modulation,''
+\emph{International Conference on Learning Representations}, 2025.
+\url{https://github.com/c-yn/AdaIR}
+
+\bibitem{eqreg}
+Y. Bai et al.,
+``A Regularization-Guided Equivariant Approach for Image Restoration,''
+\emph{IEEE/CVF Conference on Computer Vision and Pattern Recognition}, 2025.
+\href{https://openaccess.thecvf.com/content/CVPR2025/html/Bai_A_Regularization-Guided_Equivariant_Approach_for_Image_Restoration_CVPR_2025_paper.html}{CVPR 2025 open-access paper}
 
 \end{thebibliography}
 

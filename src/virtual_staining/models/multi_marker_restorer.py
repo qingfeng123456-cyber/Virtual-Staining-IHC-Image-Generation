@@ -12,8 +12,10 @@ from .context_fusion import (
     MultiScaleContextFusion,
 )
 from .context_tile_encoder import SharedTinyContextEncoder
+from .heavy_detail_unet import HeavyDetailUNet
 from .laplacian_decoder import LaplacianBaseDetailHead
 from .lightweight_detail_unet import LightweightDetailUNet
+from .multi_route_fusion import CrossGatedSkipFusion, TriPathAdaptiveFusion
 from .naf_blocks import DecoderStage, NAFStage, SobelMagnitude, TaskAdapter
 from .prototype_mixer import MultiTaskPrototypeMixer
 from .registry import RestorationOutput, register_model
@@ -59,6 +61,8 @@ class MultiMarkerRestorer(nn.Module):
         context: Mapping[str, object] | None = None,
         spatial_frequency: Mapping[str, object] | None = None,
         lightweight_unet: Mapping[str, object] | None = None,
+        heavy_unet: Mapping[str, object] | None = None,
+        multi_route_fusion: Mapping[str, object] | None = None,
     ) -> None:
         super().__init__()
         if in_channels < 1 or base_channels < 1:
@@ -108,9 +112,17 @@ class MultiMarkerRestorer(nn.Module):
             raise TypeError("spatial_frequency must be a mapping or None")
         if lightweight_unet is not None and not isinstance(lightweight_unet, Mapping):
             raise TypeError("lightweight_unet must be a mapping or None")
+        if heavy_unet is not None and not isinstance(heavy_unet, Mapping):
+            raise TypeError("heavy_unet must be a mapping or None")
+        if multi_route_fusion is not None and not isinstance(
+            multi_route_fusion, Mapping
+        ):
+            raise TypeError("multi_route_fusion must be a mapping or None")
         context_options = dict(context or {})
         spatial_frequency_options = dict(spatial_frequency or {})
         lightweight_unet_options = dict(lightweight_unet or {})
+        heavy_unet_options = dict(heavy_unet or {})
+        multi_route_options = dict(multi_route_fusion or {})
         self.context_enabled = bool(context_options.get("enabled", False))
         self.spatial_frequency_enabled = bool(
             spatial_frequency_options.get("enabled", False)
@@ -118,6 +130,22 @@ class MultiMarkerRestorer(nn.Module):
         self.lightweight_unet_enabled = bool(
             lightweight_unet_options.get("enabled", False)
         )
+        self.heavy_unet_enabled = bool(heavy_unet_options.get("enabled", False))
+        self.multi_route_fusion_enabled = bool(
+            multi_route_options.get("enabled", False)
+        )
+        if self.lightweight_unet_enabled and self.heavy_unet_enabled:
+            raise ValueError(
+                "lightweight_unet and heavy_unet are alternative detail branches"
+            )
+        if self.heavy_unet_enabled and not self.multi_route_fusion_enabled:
+            raise ValueError("heavy_unet requires multi_route_fusion.enabled=true")
+        if self.multi_route_fusion_enabled and not (
+            self.heavy_unet_enabled and self.spatial_frequency_enabled
+        ):
+            raise ValueError(
+                "multi_route_fusion requires heavy_unet and spatial_frequency"
+            )
         cross_attention_requested = bool(
             context_options.get("bottleneck_cross_attention", False)
         )
@@ -132,6 +160,12 @@ class MultiMarkerRestorer(nn.Module):
             "context_cross_attention": cross_attention_requested,
             "spatial_frequency": self.spatial_frequency_enabled,
             "lightweight_unet": self.lightweight_unet_enabled,
+            "heavy_unet": self.heavy_unet_enabled,
+            "multi_route_fusion": self.multi_route_fusion_enabled,
+            "adaptive_frequency": self.spatial_frequency_enabled
+            and bool(spatial_frequency_options.get("adaptive_frequency", False)),
+            "multi_scale_adaptive_fusion": self.multi_route_fusion_enabled,
+            "tri_path_frequency_fusion": self.multi_route_fusion_enabled,
         }
         self._task_keys = {task: f"task_{index}" for index, task in enumerate(self.target_names)}
         self._normalized_tasks = {
@@ -181,6 +215,87 @@ class MultiMarkerRestorer(nn.Module):
             )
             if self.lightweight_unet_enabled
             else None
+        )
+        heavy_widths = tuple(
+            int(width)
+            for width in heavy_unet_options.get("widths", (56, 88, 128, 176))
+        )
+        self.heavy_detail_unet = (
+            HeavyDetailUNet(
+                stem_channels,
+                widths=heavy_widths,
+                encoder_depths=tuple(
+                    int(depth)
+                    for depth in heavy_unet_options.get(
+                        "encoder_depths", (3, 4, 6, 6)
+                    )
+                ),
+                decoder_refinement_depths=tuple(
+                    int(depth)
+                    for depth in heavy_unet_options.get(
+                        "decoder_depths", (1, 2, 3)
+                    )
+                ),
+                expansion=int(heavy_unet_options.get("expansion", 3)),
+                local_kernel_size=int(
+                    heavy_unet_options.get("local_kernel_size", 3)
+                ),
+                large_kernel_size=int(
+                    heavy_unet_options.get("large_kernel_size", 11)
+                ),
+                activation_checkpoint=bool(
+                    heavy_unet_options.get("checkpoint_blocks", False)
+                ),
+            )
+            if self.heavy_unet_enabled
+            else None
+        )
+        selected_route_scales = tuple(
+            int(scale)
+            for scale in multi_route_options.get("fusion_scales", (1, 2, 4, 8))
+        )
+        selected_heavy_scales = tuple(
+            int(scale)
+            for scale in heavy_unet_options.get("fusion_scales", (1, 2, 4, 8))
+        )
+        if self.heavy_unet_enabled and set(selected_heavy_scales) != set(
+            selected_route_scales
+        ):
+            raise ValueError(
+                "heavy_unet.fusion_scales and multi_route_fusion.fusion_scales "
+                "must match"
+            )
+        self.heavy_skip_fusions = nn.ModuleDict(
+            {
+                f"scale_{scale}": CrossGatedSkipFusion(
+                    channels[index],
+                    heavy_widths[index],
+                    gate_reduction=int(multi_route_options.get("gate_reduction", 8)),
+                    residual_init=float(multi_route_options.get("residual_init", 0.02)),
+                )
+                for index, scale in enumerate((1, 2, 4))
+                if self.multi_route_fusion_enabled and scale in selected_route_scales
+            }
+        )
+        self.tri_path_fusion = (
+            TriPathAdaptiveFusion(
+                channels[-1],
+                heavy_widths[-1],
+                channels[-1],
+                gate_reduction=int(multi_route_options.get("gate_reduction", 8)),
+                residual_init=float(multi_route_options.get("residual_init", 0.02)),
+                refinement_depth=int(multi_route_options.get("refinements", 1)),
+                attention_heads=int(multi_route_options.get("heads", 8)),
+                attention_expansion=2,
+            )
+            if self.multi_route_fusion_enabled and 8 in selected_route_scales
+            else None
+        )
+        self.feature_flags["multi_scale_adaptive_fusion"] = bool(
+            self.heavy_skip_fusions
+        )
+        self.feature_flags["tri_path_frequency_fusion"] = (
+            self.tri_path_fusion is not None
         )
 
         if self.context_enabled:
@@ -251,6 +366,18 @@ class MultiMarkerRestorer(nn.Module):
                 ),
                 residual_init=float(
                     spatial_frequency_options.get("residual_init", 0.0)
+                ),
+                adaptive_frequency=bool(
+                    spatial_frequency_options.get("adaptive_frequency", False)
+                ),
+                adaptive_reduction=int(
+                    spatial_frequency_options.get("adaptive_reduction", 8)
+                ),
+                adaptive_cutoff_delta=float(
+                    spatial_frequency_options.get("adaptive_cutoff_delta", 0.12)
+                ),
+                modulation_init=float(
+                    spatial_frequency_options.get("modulation_init", 0.1)
                 ),
             )
             if self.spatial_frequency_enabled
@@ -446,6 +573,11 @@ class MultiMarkerRestorer(nn.Module):
         model_inputs = inputs
         if self.sobel is not None:
             model_inputs = torch.cat((inputs, self.sobel(inputs)), dim=1)
+        heavy_features = (
+            self.heavy_detail_unet(model_inputs)
+            if self.heavy_detail_unet is not None
+            else {}
+        )
         encoded = self._encode(model_inputs)
         if self.lightweight_detail_unet is not None:
             detail_updates = self.lightweight_detail_unet(model_inputs)
@@ -453,6 +585,18 @@ class MultiMarkerRestorer(nn.Module):
             for scale, update in detail_updates.items():
                 index = scale_to_index[scale]
                 encoded[index] = encoded[index] + update
+        fusion_diagnostics: dict[str, Tensor] = {}
+        scale_to_index = {1: 0, 2: 1, 4: 2}
+        for scale, index in scale_to_index.items():
+            key = f"scale_{scale}"
+            if key not in self.heavy_skip_fusions:
+                continue
+            encoded[index], diagnostics = self.heavy_skip_fusions[key](
+                encoded[index], heavy_features[scale]
+            )
+            fusion_diagnostics.update(
+                {f"{key}/{name}": value for name, value in diagnostics.items()}
+            )
         context_attention: dict[str, Tensor] = {}
         context_output = None
         if self.context_enabled:
@@ -482,7 +626,32 @@ class MultiMarkerRestorer(nn.Module):
             )
             context_attention["cross_8"] = cross_attention
         _ = organ_id
-        if self.spatial_frequency_mixer is not None:
+        if self.tri_path_fusion is not None:
+            if self.spatial_frequency_mixer is None or 8 not in heavy_features:
+                raise RuntimeError("Tri-path fusion routes were not initialized")
+            # The NAF/context bottleneck is already the first tri-path input.
+            # Supplying the mixer's legacy residual output here would duplicate
+            # that identity feature in the nominal frequency route.  Use the
+            # route-only update so all three inputs are structurally distinct;
+            # non-tri-path/v3 models continue to use the legacy residual forward.
+            frequency_features = self.spatial_frequency_mixer.forward_route(
+                encoded[-1]
+            )
+            fusion_diagnostics.update(
+                {
+                    f"frequency/{name}": value
+                    for name, value in self.spatial_frequency_mixer.last_diagnostics.items()
+                }
+            )
+            encoded[-1], diagnostics = self.tri_path_fusion(
+                encoded[-1],
+                heavy_features[8],
+                frequency_features,
+            )
+            fusion_diagnostics.update(
+                {f"scale_8/{name}": value for name, value in diagnostics.items()}
+            )
+        elif self.spatial_frequency_mixer is not None:
             encoded[-1] = self.spatial_frequency_mixer(encoded[-1])
         shared_bottleneck = encoded[-1]
         skips = [encoded[2], encoded[1], encoded[0]]
@@ -531,4 +700,5 @@ class MultiMarkerRestorer(nn.Module):
             detail_predictions=detail_predictions,
             logits=logits,
             context_attention=context_attention,
+            fusion_diagnostics=fusion_diagnostics,
         )

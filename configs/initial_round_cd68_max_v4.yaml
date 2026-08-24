@@ -1,0 +1,239 @@
+# RTX 4090/5090 high-capacity three-route candidate for the official CD68 task.
+#
+# V4 keeps the proven NAF/context/base-detail training recipe from v3, replaces
+# its lightweight U branch with a deeper omni-kernel U-Net, and fuses the NAF,
+# heavy-U and adaptive-frequency routes with content-dependent gates. This is a
+# separate run family: it never changes a v3 checkpoint or an in-progress run.
+project:
+  output_root: outputs/initial_round_max_v4
+  artifact_root: artifacts
+  seed: 2026
+  run_id: cd68_max_v4_seed2026
+
+data:
+  root: AUTO
+  organ: auto
+  targets: [CD68]
+  submit_targets: [CD68]
+  val_ratio: 0.2
+  image_size: 256
+  # Official JPEGs are stored as RGB, but every channel is pixel-identical.
+  # Model in one logical channel and restore RGB only when writing the ZIP.
+  input_channels: 1
+  target_channels:
+    CD68: 1
+  # Keep the exact same ROI split for fair v3/v4 comparisons and extra seeds.
+  split_seed: 2026
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  activity_sampler:
+    enabled: true
+    activity_key: target_activity
+    num_bins: 4
+    strategy: hard_mix
+    start_ratio: 0.78
+    hard_fraction: 0.30
+
+model:
+  name: multi_marker_restorer
+  base_channels: 64
+  use_sobel_input: true
+  use_task_adapters: true
+  use_prototypes: true
+  # The v3 lightweight branch and v4 heavy branch are alternative detail
+  # extractors. Enabling both is rejected by configuration validation.
+  lightweight_unet:
+    enabled: false
+  heavy_unet:
+    enabled: true
+    widths: [56, 88, 128, 176]
+    encoder_depths: [3, 4, 6, 6]
+    decoder_depths: [1, 2, 3]
+    local_kernel_size: 3
+    large_kernel_size: 11
+    expansion: 3
+    fusion_scales: [1, 2, 4, 8]
+    # Leave recomputation off on a 24/32 GiB card; enable only after an actual
+    # OOM because checkpointing trades speed for activation memory.
+    checkpoint_blocks: false
+  # The FFT route learns a bounded per-image cutoff and reciprocal low/high
+  # modulation instead of applying one fixed split to every tissue patch.
+  spatial_frequency:
+    enabled: true
+    spatial_depth: 1
+    spatial_expansion: 1
+    gate_reduction: 8
+    frequency_cutoff: 0.35
+    frequency_transition_width: 0.08
+    # The outer tri-route alpha is the stability barrier. Start this inner
+    # route at full scale so the adaptive FFT receives useful gradients early.
+    residual_init: 1.0
+    adaptive_frequency: true
+    adaptive_reduction: 8
+    adaptive_cutoff_delta: 0.12
+    modulation_init: 0.10
+  # Multi-scale content-dependent fusion replaces naive feature addition. The
+  # small nonzero alpha lets every route receive gradient from the first step.
+  multi_route_fusion:
+    enabled: true
+    fusion_scales: [1, 2, 4, 8]
+    gate_reduction: 8
+    heads: 8
+    residual_init: 0.05
+    refinements: 2
+  base_detail: true
+  base_detail_residual: true
+  max_detail_amplitude: 0.5
+  context:
+    enabled: true
+    grid_size: 3
+    missing_policy: center
+    include_center: true
+    token_dim: 64
+    encoder_width: 16
+    encoder_depth: 1
+    context_dropout: 0.0
+    fusion_scales: [4, 8]
+    bottleneck_cross_attention: true
+    cross_attention_heads: 4
+    # A small nonzero cross-attention scale lets the verified ROI context
+    # encoder receive gradients immediately in a from-scratch v4 run.
+    residual_init: 0.02
+    stop_gradient: false
+    require_verified_grid: true
+    coordinate_source: filename
+    allow_numeric_stem_inference: false
+    allow_edge_graph_inference: false
+    cache_size: 512
+
+loss:
+  schedule: two_phase
+  phase_a_ratio: 0.45
+  interpolation: cosine
+  phase_a:
+    mse: 0.20
+    charbonnier: 0.38
+    ssim: 0.30
+    ms_ssim: 0.05
+    pyramid: 0.02
+    gradient: 0.05
+    statistics: 0.0
+  phase_b:
+    mse: 0.29
+    charbonnier: 0.29
+    ssim: 0.33
+    ms_ssim: 0.02
+    pyramid: 0.02
+    gradient: 0.04
+    statistics: 0.01
+  deep_supervision_weights: [1.0, 0.5, 0.25]
+  deep_supervision_final_weights: [1.0, 0.1, 0.05]
+  competition_proxy:
+    enabled: true
+    weight: 0.06
+    start_ratio: 0.55
+    ssim_weight: 0.70
+    window_size: 7
+    psnr_cap: 60.0
+  frequency: 0.01
+  correlation: 0.0
+  prototype_activation: 0.001
+  prototype_diversity: 0.001
+  fluorescence_foreground:
+    enabled: false
+    weight: 0.0
+
+augmentation:
+  max_translation: 0
+  horizontal_flip_probability: 0.5
+  vertical_flip_probability: 0.5
+  rotate_probability: 1.0
+  gamma_range: [0.9, 1.1]
+  gamma_probability: 0.5
+  brightness_delta: 0.05
+  brightness_probability: 0.5
+  contrast_range: [0.95, 1.05]
+  contrast_probability: 0.5
+  noise_std: 0.005
+  noise_probability: 0.25
+
+train:
+  device: cuda
+  epochs: 100
+  # Effective batch remains 12. Batch 6 gives the heavy branch activation
+  # headroom; two microsteps preserve the v3 optimizer-update scale.
+  batch_size: 6
+  gradient_accumulation: 2
+  lr: 0.00018
+  weight_decay: 0.0001
+  warmup_epochs: 4
+  scheduler: cosine
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip: 1.0
+  ema: true
+  ema_decay: 0.999
+  evaluate_weight_sources: [raw, ema]
+  early_stopping_patience: 5
+  save_top_k: 0
+  checkpoint_metrics: [ssim, proxy]
+  validate_every_n_epochs: 5
+  retain_validation_records_in_history: false
+  async_metric_logging: true
+  batch_metric_log_interval: 0
+  # Leave enough room for roughly five-minute late epochs plus periodic raw/EMA
+  # validation while still reserving time inside a nine-hour rental window.
+  max_wall_time_hours: 8.5
+  float32_matmul_precision: high
+  channels_last: true
+  cudnn_benchmark: true
+  optimizer_options:
+    enabled: true
+    no_decay_norm_bias: true
+    fused: auto
+  equivariance:
+    enabled: true
+    probability: 0.15
+    weight: 0.015
+    start_ratio: 0.10
+    ramp_end_ratio: 0.40
+    smooth_l1_beta: 0.01
+  gpu_monitor:
+    enabled: true
+    interval_seconds: 2.0
+  compile:
+    enabled: false
+    mode: reduce-overhead
+    backend: inductor
+  prototype_monitor:
+    enabled: true
+    dead_threshold: 0.0001
+    attention_visuals_enabled: false
+
+validation:
+  primary_metric: ssim
+  primary_domain: jpg
+  domains: [float, uint8, jpg]
+  group_by_roi: true
+  bootstrap_by_roi: true
+  bootstrap_samples: 1000
+  save_predictions: false
+
+inference:
+  use_ema: false
+  weight_source: best_jpg
+  tta: d4
+  tta_policy: configured
+
+pretrain:
+  enabled: false
+
+multitask:
+  optimizer: equal
+  gradient_cosine_enabled: false
+
+submission:
+  official: true
+  allow_smoke_manifest: false

@@ -121,19 +121,73 @@ def _module_inventory(model: Any) -> dict[str, Any]:
     """Summarize model components without profiling hooks or training overhead."""
 
     modules: list[dict[str, Any]] = []
+    branches: dict[str, dict[str, Any]] = {}
+
+    def branch_name(module_name: str) -> str:
+        normalized = module_name.casefold()
+        if normalized in {
+            "task_embeddings",
+            "adapters",
+            "output_heads",
+            "base_detail_heads",
+        } or "head" in normalized:
+            return "conditioning_and_output"
+        if "context" in normalized:
+            return "roi_context"
+        if "unet" in normalized or "detail_branch" in normalized:
+            return "detail_unet"
+        if "frequency" in normalized or "fft" in normalized:
+            return "frequency_path"
+        if "fusion" in normalized or "gate" in normalized:
+            return "adaptive_fusion"
+        if "prototype" in normalized:
+            return "prototype_path"
+        if normalized in {
+            "sobel",
+            "stem",
+            "encoder_stages",
+            "downsamples",
+            "shared_decoder",
+            "separate_decoders",
+        }:
+            return "local_backbone"
+        return "other"
+
     for name, module in model.named_children():
         parameters = list(module.parameters())
-        modules.append(
-            {
-                "name": name,
-                "class_name": type(module).__name__,
-                "parameters": int(sum(parameter.numel() for parameter in parameters)),
-                "trainable_parameters": int(
-                    sum(parameter.numel() for parameter in parameters if parameter.requires_grad)
-                ),
-                "buffers": int(sum(buffer.numel() for buffer in module.buffers())),
-            }
+        parameter_count = int(sum(parameter.numel() for parameter in parameters))
+        trainable_count = int(
+            sum(parameter.numel() for parameter in parameters if parameter.requires_grad)
         )
+        module_entry = {
+            "name": name,
+            "class_name": type(module).__name__,
+            "parameters": parameter_count,
+            "trainable_parameters": trainable_count,
+            "buffers": int(sum(buffer.numel() for buffer in module.buffers())),
+        }
+        modules.append(module_entry)
+        branch = branches.setdefault(
+            branch_name(name),
+            {
+                "parameters": 0,
+                "trainable_parameters": 0,
+                "top_level_modules": [],
+            },
+        )
+        branch["parameters"] += parameter_count
+        branch["trainable_parameters"] += trainable_count
+        branch["top_level_modules"].append(name)
+
+    root_parameters = list(model.parameters(recurse=False))
+    if root_parameters:
+        branches["root_parameters"] = {
+            "parameters": int(sum(parameter.numel() for parameter in root_parameters)),
+            "trainable_parameters": int(
+                sum(parameter.numel() for parameter in root_parameters if parameter.requires_grad)
+            ),
+            "top_level_modules": [],
+        }
     all_parameters = list(model.parameters())
     return {
         "total_parameters": int(sum(parameter.numel() for parameter in all_parameters)),
@@ -141,10 +195,13 @@ def _module_inventory(model: Any) -> dict[str, Any]:
             sum(parameter.numel() for parameter in all_parameters if parameter.requires_grad)
         ),
         "feature_flags": _to_jsonable(getattr(model, "feature_flags", {})),
+        "branch_parameter_counts": branches,
         "top_level_modules": modules,
         "note": (
-            "Parameter counts are structural module sizes. Runtime performance is "
-            "recorded per epoch in epoch_metrics.jsonl and performance_summary.json."
+            "Parameter counts are structural module sizes. Branch groups classify "
+            "top-level modules by role and do not activate disabled alternatives. "
+            "Runtime performance is recorded per epoch in epoch_metrics.jsonl and "
+            "performance_summary.json."
         ),
     }
 
@@ -289,9 +346,17 @@ class ExperimentLogSession:
         train = normalized.get("train", {})
         validation = normalized.get("validation", {})
         macro = validation.get("macro", {}) if isinstance(validation, Mapping) else {}
+        epoch_display: Any = "?"
+        if isinstance(train, Mapping):
+            epoch_display = train.get("epoch_number")
+            if epoch_display is None and isinstance(train.get("epoch"), int):
+                epoch_display = int(train["epoch"]) + 1
+            total_epochs = train.get("total_epochs")
+            if total_epochs is not None:
+                epoch_display = f"{epoch_display}/{total_epochs}"
         logging.getLogger("virtual_staining").info(
             "Epoch %s | loss=%s | %.3f img/s | peak_vram_mib=%.1f | val_ssim=%s | val_psnr=%s",
-            train.get("epoch", "?") if isinstance(train, Mapping) else "?",
+            epoch_display,
             train.get("loss", "?") if isinstance(train, Mapping) else "?",
             float(train.get("images_per_second", 0.0)) if isinstance(train, Mapping) else 0.0,
             float(train.get("peak_vram_bytes", 0.0)) / 1024**2
@@ -300,6 +365,21 @@ class ExperimentLogSession:
             macro.get("mean_ssim", "?") if isinstance(macro, Mapping) else "?",
             macro.get("mean_psnr", "?") if isinstance(macro, Mapping) else "?",
         )
+        if isinstance(train, Mapping):
+            fusion_values = {
+                str(key).removeprefix("fusion/"): float(value)
+                for key, value in train.items()
+                if str(key).startswith("fusion/")
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+            }
+            if fusion_values:
+                rendered = " | ".join(
+                    f"{key}={value:.6g}" for key, value in sorted(fusion_values.items())
+                )
+                logging.getLogger("virtual_staining").info(
+                    "Fusion diagnostics | %s", rendered
+                )
 
     def _copy_run_artifacts(self, run_dir: Path) -> None:
         files = {
@@ -368,10 +448,14 @@ class ExperimentLogSession:
         samples = [int(row.get("seen_samples", 0)) for row in train_rows]
         total_duration = float(sum(durations))
         total_samples = int(sum(samples))
-        latest_validation = (
-            history[-1].get("validation", {})
-            if history and isinstance(history[-1], Mapping)
+        latest_entry = history[-1] if history and isinstance(history[-1], Mapping) else {}
+        latest_train = (
+            latest_entry.get("train", {})
+            if isinstance(latest_entry.get("train"), Mapping)
             else {}
+        )
+        latest_validation = (
+            latest_entry.get("validation", {}) if latest_entry else {}
         )
         best_entry: Mapping[str, Any] | None = None
         best_ssim = -math.inf
@@ -411,12 +495,53 @@ class ExperimentLogSession:
                 "max_oom_retries": max(
                     (int(row.get("oom_retries", 0)) for row in train_rows), default=0
                 ),
+                "last_epoch_number": latest_train.get("epoch_number"),
+                "requested_total_epochs": latest_train.get("total_epochs"),
+                "stop_reason": latest_entry.get("stop_reason"),
+                "stopped_by_early_stopping": bool(
+                    latest_entry.get("stopped_by_early_stopping", False)
+                ),
+                "stopped_by_time_budget": bool(
+                    latest_entry.get("stopped_by_time_budget", False)
+                ),
             },
             "latest_validation": _to_jsonable(latest_validation),
             "best_validation_by_primary_ssim": _to_jsonable(best_entry)
             if best_entry is not None
             else None,
         }
+        fusion_names = sorted(
+            {
+                str(key)
+                for row in train_rows
+                for key, value in row.items()
+                if str(key).startswith("fusion/")
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+            }
+        )
+        if fusion_names:
+            latest_row = train_rows[-1]
+            summary["fusion_diagnostics"] = {
+                "latest": {
+                    name.removeprefix("fusion/"): float(latest_row[name])
+                    for name in fusion_names
+                    if isinstance(latest_row.get(name), (int, float))
+                    and math.isfinite(float(latest_row[name]))
+                },
+                "epoch_mean": {
+                    name.removeprefix("fusion/"): float(sum(values) / len(values))
+                    for name in fusion_names
+                    if (
+                        values := [
+                            float(row[name])
+                            for row in train_rows
+                            if isinstance(row.get(name), (int, float))
+                            and math.isfinite(float(row[name]))
+                        ]
+                    )
+                },
+            }
         _write_json(self.directory / "performance_summary.json", summary)
         return summary
 
@@ -430,6 +555,9 @@ class ExperimentLogSession:
             f"- Run key: {self.run_key}",
             f"- Run directory: {summary.get('run_dir')}",
             f"- Recorded epochs: {training.get('epochs_recorded')}",
+            f"- Last epoch: {training.get('last_epoch_number')} / "
+            f"{training.get('requested_total_epochs')}",
+            f"- Stop reason: {training.get('stop_reason')}",
             f"- Full command seconds: {training.get('command_elapsed_seconds')}",
             f"- Total training seconds: {training.get('total_duration_seconds')}",
             f"- End-to-end images/second: {training.get('end_to_end_images_per_second')}",

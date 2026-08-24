@@ -273,6 +273,76 @@ class _AsyncMetricBuffer:
         return loss_float, component_floats
 
 
+class _AsyncScalarBuffer:
+    """Accumulate detached scalar diagnostics on-device until epoch end.
+
+    Unlike loss-component logging, this buffer is always asynchronous. This is
+    important for content-adaptive fusion diagnostics: reading gate statistics
+    with ``.item()`` after every forward would serialize CUDA execution even
+    when legacy synchronous loss logging is selected. Detached scalars stay on
+    the training device; float32 means are formed and transferred to CPU
+    together once per epoch.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._values: dict[str, list[Tensor]] = defaultdict(list)
+
+    def append(self, values: Mapping[str, Tensor]) -> None:
+        """Add scalar tensors without forcing a device synchronization."""
+
+        for key, value in values.items():
+            if not isinstance(value, Tensor) or value.numel() != 1:
+                continue
+            detached = value.detach()
+            if detached.device != self._device:
+                detached = detached.to(device=self._device)
+            name = str(key)
+            self._values[name].append(detached)
+
+    def sync(self) -> dict[str, float]:
+        """Return epoch means after one batched device-to-host transfer."""
+
+        names = sorted(name for name, values in self._values.items() if values)
+        if not names:
+            return {}
+        means = torch.stack(
+            [torch.stack(self._values[name]).float().mean() for name in names]
+        )
+        host_values = means.cpu().tolist()
+        self._values.clear()
+        return {name: float(value) for name, value in zip(names, host_values, strict=True)}
+
+
+def _fusion_diagnostic_scalars(output: Any) -> dict[str, Tensor]:
+    """Flatten scalar tensors exposed by ``output.fusion_diagnostics``.
+
+    Mapping outputs are accepted for compatibility with small custom models.
+    Non-scalar tensors are intentionally ignored: feature maps and per-sample
+    gates belong in opt-in visualisation artifacts, not an epoch scalar log.
+    """
+
+    if isinstance(output, Mapping):
+        diagnostics = output.get("fusion_diagnostics", {})
+    else:
+        diagnostics = getattr(output, "fusion_diagnostics", {})
+    if not isinstance(diagnostics, Mapping):
+        return {}
+
+    scalars: dict[str, Tensor] = {}
+
+    def collect(values: Mapping[str, Any], prefix: str = "") -> None:
+        for key, value in values.items():
+            name = f"{prefix}/{key}" if prefix else str(key)
+            if isinstance(value, Mapping):
+                collect(value, name)
+            elif isinstance(value, Tensor) and value.numel() == 1:
+                scalars[name] = value.detach()
+
+    collect(diagnostics)
+    return scalars
+
+
 class Trainer:
     """Train an arbitrary restoration model against a compatible loss callable."""
 
@@ -799,21 +869,36 @@ class Trainer:
         )
 
     def _evaluate_weight_sources(
-        self, validator: Any
+        self,
+        validator: Any,
+        *,
+        epoch_number: int | None = None,
+        total_epochs: int | None = None,
     ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
         sources = self._validation_weight_sources(validator)
         original_use_ema = bool(getattr(validator, "use_ema", False))
         original_diagnostic_source = getattr(
             validator, "prototype_diagnostics_weight_source", None
         )
+        original_progress_label = getattr(validator, "progress_label", None)
         results: dict[str, dict[str, Any]] = {}
         try:
-            for source in sources:
+            for source_index, source in enumerate(sources, start=1):
                 if source == "ema" and getattr(validator, "ema", None) is None:
                     validator.ema = self.ema
                 validator.use_ema = source == "ema"
                 if hasattr(validator, "prototype_diagnostics_weight_source"):
                     validator.prototype_diagnostics_weight_source = source
+                if hasattr(validator, "progress_label"):
+                    epoch_label = (
+                        f"epoch {epoch_number}/{total_epochs}"
+                        if epoch_number is not None and total_epochs is not None
+                        else "training validation"
+                    )
+                    validator.progress_label = (
+                        f"{epoch_label}, weights={source}, "
+                        f"pass={source_index}/{len(sources)}"
+                    )
                 result = validator.evaluate()
                 if not isinstance(result, Mapping):
                     raise TypeError("Validator.evaluate() must return a mapping")
@@ -824,6 +909,8 @@ class Trainer:
                 validator.prototype_diagnostics_weight_source = (
                     original_diagnostic_source
                 )
+            if hasattr(validator, "progress_label"):
+                validator.progress_label = original_progress_label
         selected = max(sources, key=lambda source: self._validation_rank(results[source]))
         self.selected_weight_source = selected
         return results[selected], results, selected
@@ -903,7 +990,7 @@ class Trainer:
 
     def _backward_microbatch(
         self, batch: Any, *, loss_divisor: float, keep_on_device: bool = False
-    ) -> tuple[Any, dict[str, Any]]:
+    ) -> tuple[Any, dict[str, Any], dict[str, Tensor]]:
         inputs, targets, metadata = unpack_batch(batch)
         inputs = move_to_device(inputs, self.device)
         inputs = self._to_channels_last(inputs)
@@ -927,6 +1014,7 @@ class Trainer:
                 effective_task,
                 model_kwargs=model_kwargs,
             )
+            fusion_diagnostics = _fusion_diagnostic_scalars(output)
             total, components, per_task = self._compute_loss(
                 output, targets, keep_on_device=keep_on_device
             )
@@ -1011,12 +1099,12 @@ class Trainer:
         if keep_on_device:
             # Return detached 0-dim on-device tensors; the caller accumulates
             # them and synchronizes once per epoch (or every N batches).
-            return logged_total, components
-        return float(logged_total.cpu()), components
+            return logged_total, components, fusion_diagnostics
+        return float(logged_total.cpu()), components, fusion_diagnostics
 
     def _run_batch_with_oom_recovery(
         self, batch: Any, *, keep_on_device: bool = False
-    ) -> tuple[Any, dict[str, Any]]:
+    ) -> tuple[Any, dict[str, Any], dict[str, Tensor]]:
         batch_size = infer_batch_size(batch)
         while True:
             chunk_size = max(1, math.ceil(batch_size / self.microbatch_factor))
@@ -1025,35 +1113,94 @@ class Trainer:
                 for start in range(0, batch_size, chunk_size)
             ]
             try:
-                divisor = float(self.gradient_accumulation * len(chunks))
+                chunk_sizes = [infer_batch_size(chunk) for chunk in chunks]
+                chunk_weights = [size / float(batch_size) for size in chunk_sizes]
                 if keep_on_device:
                     loss_tensors: list[Tensor] = []
                     component_lists: dict[str, list[Tensor]] = defaultdict(list)
-                    for chunk in chunks:
-                        value, components = self._backward_microbatch(
+                    diagnostic_lists: dict[str, list[Tensor]] = defaultdict(list)
+                    diagnostic_weights: dict[str, list[float]] = defaultdict(list)
+                    for chunk, size, weight in zip(
+                        chunks, chunk_sizes, chunk_weights, strict=True
+                    ):
+                        divisor = float(
+                            self.gradient_accumulation * batch_size / size
+                        )
+                        value, components, diagnostics = self._backward_microbatch(
                             chunk, loss_divisor=divisor, keep_on_device=True
                         )
                         loss_tensors.append(value)
                         for key, component in components.items():
                             component_lists[str(key)].append(component)
-                    loss_mean = torch.stack(loss_tensors).mean()
+                        for key, diagnostic in diagnostics.items():
+                            diagnostic_lists[str(key)].append(diagnostic.detach())
+                            diagnostic_weights[str(key)].append(weight)
+                    weight_tensor = torch.as_tensor(
+                        chunk_weights,
+                        device=loss_tensors[0].device,
+                        dtype=loss_tensors[0].dtype,
+                    )
+                    loss_mean = torch.sum(torch.stack(loss_tensors) * weight_tensor)
                     component_means: dict[str, Any] = {
-                        key: torch.stack(values).mean()
+                        key: torch.sum(torch.stack(values) * weight_tensor)
                         for key, values in component_lists.items()
                         if values
                     }
-                    return loss_mean, component_means
+                    if len(chunks) == 1:
+                        diagnostic_means = {
+                            key: values[0] for key, values in diagnostic_lists.items() if values
+                        }
+                    else:
+                        diagnostic_means = {
+                            key: torch.sum(
+                                torch.stack(values).float()
+                                * torch.as_tensor(
+                                    diagnostic_weights[key],
+                                    device=values[0].device,
+                                    dtype=torch.float32,
+                                )
+                            )
+                            / float(sum(diagnostic_weights[key]))
+                            for key, values in diagnostic_lists.items()
+                            if values
+                        }
+                    return loss_mean, component_means, diagnostic_means
                 losses: list[float] = []
                 component_sums: dict[str, float] = defaultdict(float)
-                for chunk in chunks:
-                    value, components = self._backward_microbatch(
+                diagnostic_lists: dict[str, list[Tensor]] = defaultdict(list)
+                diagnostic_weights: dict[str, list[float]] = defaultdict(list)
+                for chunk, size, weight in zip(
+                    chunks, chunk_sizes, chunk_weights, strict=True
+                ):
+                    divisor = float(self.gradient_accumulation * batch_size / size)
+                    value, components, diagnostics = self._backward_microbatch(
                         chunk, loss_divisor=divisor
                     )
-                    losses.append(value)
+                    losses.append(value * weight)
                     for key, component in components.items():
-                        component_sums[key] += component
-                averaged = {key: value / len(chunks) for key, value in component_sums.items()}
-                return float(np.mean(losses)), averaged
+                        component_sums[key] += component * weight
+                    for key, diagnostic in diagnostics.items():
+                        diagnostic_lists[str(key)].append(diagnostic.detach())
+                        diagnostic_weights[str(key)].append(weight)
+                if len(chunks) == 1:
+                    diagnostic_means = {
+                        key: values[0] for key, values in diagnostic_lists.items() if values
+                    }
+                else:
+                    diagnostic_means = {
+                        key: torch.sum(
+                            torch.stack(values).float()
+                            * torch.as_tensor(
+                                diagnostic_weights[key],
+                                device=values[0].device,
+                                dtype=torch.float32,
+                            )
+                        )
+                        / float(sum(diagnostic_weights[key]))
+                        for key, values in diagnostic_lists.items()
+                        if values
+                    }
+                return float(np.sum(losses)), dict(component_sums), diagnostic_means
             except BaseException as error:
                 if self.device.type != "cuda" or not _is_cuda_oom(error):
                     raise
@@ -1178,6 +1325,7 @@ class Trainer:
         async_buffer: _AsyncMetricBuffer | None = (
             _AsyncMetricBuffer(self.device) if self.async_metric_logging else None
         )
+        fusion_buffer = _AsyncScalarBuffer(self.device)
         batch_count = len(self.dataloader) if hasattr(self.dataloader, "__len__") else None
         seen_batches = 0
         seen_samples = 0
@@ -1202,16 +1350,23 @@ class Trainer:
                 batch_samples = infer_batch_size(batch)
                 seen_samples += batch_samples
                 if async_buffer is not None:
-                    loss_tensor, component_tensors = self._run_batch_with_oom_recovery(
-                        batch, keep_on_device=True
-                    )
+                    (
+                        loss_tensor,
+                        component_tensors,
+                        fusion_diagnostics,
+                    ) = self._run_batch_with_oom_recovery(batch, keep_on_device=True)
                     async_buffer.append(loss_tensor, component_tensors)
                     loss_value: float | None = None
                 else:
-                    loss_value, logged = self._run_batch_with_oom_recovery(batch)
+                    (
+                        loss_value,
+                        logged,
+                        fusion_diagnostics,
+                    ) = self._run_batch_with_oom_recovery(batch)
                     losses.append(loss_value)
                     for key, value in logged.items():
                         components[key].append(float(value))
+                fusion_buffer.append(fusion_diagnostics)
                 seen_batches += 1
                 if self._oom_cleared_accumulated_gradients:
                     accumulated_batches = 0
@@ -1277,8 +1432,11 @@ class Trainer:
             component_means = {
                 key: float(np.mean(values)) for key, values in components.items()
             }
+        fusion_means = fusion_buffer.sync()
         result: dict[str, float | int] = {
             "epoch": int(epoch),
+            "epoch_number": int(epoch) + 1,
+            "total_epochs": int(total_epochs) if total_epochs is not None else int(epoch) + 1,
             "loss": epoch_loss,
             "duration_seconds": duration_seconds,
             "seen_samples": seen_samples,
@@ -1314,6 +1472,8 @@ class Trainer:
         }
         for key, value in component_means.items():
             result[f"loss/{key}"] = value
+        for key, value in fusion_means.items():
+            result[f"fusion/{key}"] = value
         result.update(gpu_monitor_summary)
         if self.prototype_monitor is not None:
             prototype_summary = self.prototype_monitor.finalize_epoch(epoch)
@@ -1462,7 +1622,11 @@ class Trainer:
                     validator.prototype_diagnostics_epoch = int(epoch)
                 validation_start = time.perf_counter()
                 validation, source_results, selected_source = (
-                    self._evaluate_weight_sources(validator)
+                    self._evaluate_weight_sources(
+                        validator,
+                        epoch_number=epoch + 1,
+                        total_epochs=total_epochs,
+                    )
                 )
                 entry["validation_duration_seconds"] = float(
                     time.perf_counter() - validation_start
@@ -1493,6 +1657,35 @@ class Trainer:
                     entry["validation_skipped"] = True
                     entry["validation_every_n_epochs"] = validate_every
             self.metric_history.append(entry)
+            previous_best_ssim = -float("inf")
+            if validator is not None and is_validation_epoch:
+                previous_best_ssim = max(
+                    (
+                        float(
+                            item.get("validation", {})
+                            .get("macro", {})
+                            .get("mean_ssim", -float("inf"))
+                        )
+                        for item in self.metric_history[:-1]
+                        if item.get("validated", False)
+                    ),
+                    default=-float("inf"),
+                )
+                if current["ssim"] > previous_best_ssim:
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+            early_stopping_triggered = bool(
+                validator is not None
+                and is_validation_epoch
+                and patience
+                and epochs_without_improvement >= patience
+                and epoch < total_epochs - 1
+            )
+            entry["validation_checks_without_improvement"] = (
+                epochs_without_improvement
+            )
+            entry["early_stopping_patience"] = patience
             if validator is None:
                 logging.getLogger("virtual_staining").info(
                     "Epoch %d/%d complete | loss=%.6f | %.3f img/s",
@@ -1544,6 +1737,17 @@ class Trainer:
                 estimated_next_safe_stop_seconds
             )
             entry["stopped_by_time_budget"] = time_budget_stop
+            entry["stopped_by_early_stopping"] = bool(
+                early_stopping_triggered and not time_budget_stop
+            )
+            if time_budget_stop:
+                entry["stop_reason"] = "time_budget"
+            elif early_stopping_triggered:
+                entry["stop_reason"] = "early_stopping"
+            elif epoch == total_epochs - 1:
+                entry["stop_reason"] = "completed_epochs"
+            else:
+                entry["stop_reason"] = None
             self._notify_epoch_callbacks(entry)
             if output_dir is not None:
                 checkpoint_start = time.perf_counter()
@@ -1690,19 +1894,18 @@ class Trainer:
                     estimated_next_safe_stop_seconds,
                 )
                 break
-            if validator is not None and is_validation_epoch:
-                previous_best = max(
-                    (
-                        float(item.get("validation", {}).get("macro", {}).get("mean_ssim", -float("inf")))
-                        for item in self.metric_history[:-1]
-                        if item.get("validated", False)
-                    ),
-                    default=-float("inf"),
+            if early_stopping_triggered:
+                logging.getLogger("virtual_staining").warning(
+                    "Early stopping after epoch %d/%d: validation SSIM did not "
+                    "improve for %d consecutive validation checks "
+                    "(patience=%d, validate_every=%d, best=%.6f, current=%.6f)",
+                    epoch + 1,
+                    total_epochs,
+                    epochs_without_improvement,
+                    patience,
+                    validate_every,
+                    max(previous_best_ssim, current["ssim"]),
+                    current["ssim"],
                 )
-                if current["ssim"] > previous_best:
-                    epochs_without_improvement = 0
-                else:
-                    epochs_without_improvement += 1
-                if patience and epochs_without_improvement >= patience:
-                    break
+                break
         return self.metric_history

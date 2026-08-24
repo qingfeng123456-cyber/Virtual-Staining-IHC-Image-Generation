@@ -32,6 +32,7 @@ class RestorationOutput:
     context_attention: dict[str, Tensor] = field(default_factory=dict)
     prototype_usage: dict[str, dict[str, Tensor]] = field(default_factory=dict)
     intermediate_features: dict[str, Tensor] = field(default_factory=dict)
+    fusion_diagnostics: dict[str, Tensor] = field(default_factory=dict)
 
     @property
     def prediction(self) -> Tensor:

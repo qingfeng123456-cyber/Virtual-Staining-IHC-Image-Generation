@@ -37,7 +37,7 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "conditioning", "adapters", "prototypes", "output", "intensity_calibrator",
         "organ_names", "context_stop_gradient", "use_laplacian_input", "base_detail",
         "base_detail_residual", "max_detail_amplitude", "spatial_frequency",
-        "lightweight_unet",
+        "lightweight_unet", "heavy_unet", "multi_route_fusion",
     },
     "loss": {
         "charbonnier", "ssim", "ms_ssim", "gradient", "frequency",
@@ -139,10 +139,21 @@ _NESTED_ALLOWED: dict[tuple[str, str], set[str]] = {
     ("model", "spatial_frequency"): {
         "enabled", "spatial_depth", "spatial_expansion", "gate_reduction",
         "frequency_cutoff", "frequency_transition_width", "residual_init",
+        "adaptive_frequency", "adaptive_reduction", "adaptive_cutoff_delta",
+        "modulation_init",
     },
     ("model", "lightweight_unet"): {
         "enabled", "widths", "depths", "kernel_size", "expansion",
         "fusion_scales", "residual_init",
+    },
+    ("model", "heavy_unet"): {
+        "enabled", "widths", "encoder_depths", "decoder_depths",
+        "local_kernel_size", "large_kernel_size", "expansion",
+        "fusion_scales", "checkpoint_blocks",
+    },
+    ("model", "multi_route_fusion"): {
+        "enabled", "fusion_scales", "gate_reduction", "heads",
+        "residual_init", "refinements",
     },
     ("model", "global_mixer"): {
         "enabled", "type", "blocks_1_8", "blocks_1_16", "heads", "heads_1_8",
@@ -757,6 +768,21 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ConfigError(
                     f"model.spatial_frequency.{key} must be a positive integer"
                 )
+        if not isinstance(
+            spatial_frequency.get("adaptive_frequency", False), bool
+        ):
+            raise ConfigError(
+                "model.spatial_frequency.adaptive_frequency must be boolean"
+            )
+        adaptive_reduction = spatial_frequency.get("adaptive_reduction", 8)
+        if (
+            isinstance(adaptive_reduction, bool)
+            or not isinstance(adaptive_reduction, int)
+            or adaptive_reduction < 1
+        ):
+            raise ConfigError(
+                "model.spatial_frequency.adaptive_reduction must be a positive integer"
+            )
         try:
             frequency_cutoff = float(
                 spatial_frequency.get("frequency_cutoff", 0.35)
@@ -765,13 +791,25 @@ def validate_config(config: dict[str, Any]) -> None:
                 spatial_frequency.get("frequency_transition_width", 0.08)
             )
             residual_init = float(spatial_frequency.get("residual_init", 0.0))
+            adaptive_cutoff_delta = float(
+                spatial_frequency.get("adaptive_cutoff_delta", 0.12)
+            )
+            modulation_init = float(
+                spatial_frequency.get("modulation_init", 0.0)
+            )
         except (TypeError, ValueError) as error:
             raise ConfigError(
                 "model.spatial_frequency floating-point options must be numeric"
             ) from error
         if not all(
             math.isfinite(value)
-            for value in (frequency_cutoff, transition_width, residual_init)
+            for value in (
+                frequency_cutoff,
+                transition_width,
+                residual_init,
+                adaptive_cutoff_delta,
+                modulation_init,
+            )
         ):
             raise ConfigError(
                 "model.spatial_frequency floating-point options must be finite"
@@ -784,6 +822,37 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ConfigError(
                 "model.spatial_frequency.frequency_transition_width must be positive"
             )
+        if not 0.0 <= residual_init <= 1.0:
+            raise ConfigError(
+                "model.spatial_frequency.residual_init must lie in [0, 1]"
+            )
+        if not 0.0 <= adaptive_cutoff_delta < 0.5:
+            raise ConfigError(
+                "model.spatial_frequency.adaptive_cutoff_delta must lie in [0, 0.5)"
+            )
+        if not 0.0 <= modulation_init <= 1.0:
+            raise ConfigError(
+                "model.spatial_frequency.modulation_init must lie in [0, 1]"
+            )
+        if spatial_frequency.get("adaptive_frequency", False):
+            if not bool(spatial_frequency.get("enabled", False)):
+                raise ConfigError(
+                    "Adaptive frequency requires model.spatial_frequency.enabled=true"
+                )
+            max_cutoff_delta = min(frequency_cutoff, 1.0 - frequency_cutoff)
+            if adaptive_cutoff_delta >= max_cutoff_delta:
+                raise ConfigError(
+                    "Enabled adaptive frequency requires adaptive_cutoff_delta "
+                    "to keep the learned cutoff strictly inside (0, 1)"
+                )
+            if adaptive_cutoff_delta <= 0.0:
+                raise ConfigError(
+                    "Enabled adaptive frequency requires adaptive_cutoff_delta > 0"
+                )
+            if modulation_init <= 0.0:
+                raise ConfigError(
+                    "Enabled adaptive frequency requires modulation_init > 0"
+                )
     lightweight_unet = config["model"].get("lightweight_unet", {})
     if lightweight_unet:
         if not isinstance(lightweight_unet.get("enabled", False), bool):
@@ -857,6 +926,169 @@ def validate_config(config: dict[str, Any]) -> None:
                 "model.lightweight_unet.residual_init must be zero so enabling "
                 "the branch preserves the pretrained/local backbone initially"
             )
+    heavy_unet = config["model"].get("heavy_unet", {})
+    if heavy_unet:
+        heavy_enabled = heavy_unet.get("enabled", False)
+        if not isinstance(heavy_enabled, bool):
+            raise ConfigError("model.heavy_unet.enabled must be boolean")
+        for key, default, expected_length in (
+            ("widths", [32, 48, 72, 96], 4),
+            ("encoder_depths", [2, 2, 3, 3], 4),
+            ("decoder_depths", [1, 1, 2], 3),
+        ):
+            values = heavy_unet.get(key, default)
+            if (
+                not isinstance(values, list)
+                or len(values) != expected_length
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 1
+                    for value in values
+                )
+            ):
+                raise ConfigError(
+                    f"model.heavy_unet.{key} must contain "
+                    f"{expected_length} positive integers"
+                )
+        for key, default in (
+            ("local_kernel_size", 3),
+            ("large_kernel_size", 11),
+        ):
+            value = heavy_unet.get(key, default)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 3
+                or value % 2 == 0
+            ):
+                raise ConfigError(
+                    f"model.heavy_unet.{key} must be an odd integer >= 3"
+                )
+        heavy_expansion = heavy_unet.get("expansion", 2)
+        if (
+            isinstance(heavy_expansion, bool)
+            or not isinstance(heavy_expansion, int)
+            or heavy_expansion < 1
+        ):
+            raise ConfigError("model.heavy_unet.expansion must be a positive integer")
+        heavy_scales = heavy_unet.get("fusion_scales", [1, 2, 4, 8])
+        if (
+            not isinstance(heavy_scales, list)
+            or not heavy_scales
+            or any(
+                isinstance(scale, bool)
+                or not isinstance(scale, int)
+                or scale not in {1, 2, 4, 8}
+                for scale in heavy_scales
+            )
+            or len(set(heavy_scales)) != len(heavy_scales)
+        ):
+            raise ConfigError(
+                "model.heavy_unet.fusion_scales must be unique values from 1/2/4/8"
+            )
+        if not isinstance(heavy_unet.get("checkpoint_blocks", False), bool):
+            raise ConfigError("model.heavy_unet.checkpoint_blocks must be boolean")
+        if heavy_enabled:
+            lightweight_enabled = bool(lightweight_unet.get("enabled", False))
+            if lightweight_enabled:
+                raise ConfigError(
+                    "model.heavy_unet and model.lightweight_unet are mutually exclusive"
+                )
+            model_name = "".join(
+                character
+                for character in str(config["model"].get("name", "")).casefold()
+                if character.isalnum()
+            )
+            if model_name != "multimarkerrestorer":
+                raise ConfigError(
+                    "model.heavy_unet is supported only by MultiMarkerRestorer"
+                )
+            configured_fusion = config["model"].get("multi_route_fusion", {})
+            if not bool(configured_fusion.get("enabled", False)):
+                raise ConfigError(
+                    "Enabled heavy U-Net requires "
+                    "model.multi_route_fusion.enabled=true"
+                )
+    multi_route_fusion = config["model"].get("multi_route_fusion", {})
+    if multi_route_fusion:
+        fusion_enabled = multi_route_fusion.get("enabled", False)
+        if not isinstance(fusion_enabled, bool):
+            raise ConfigError("model.multi_route_fusion.enabled must be boolean")
+        route_scales = multi_route_fusion.get("fusion_scales", [1, 2, 4, 8])
+        if (
+            not isinstance(route_scales, list)
+            or not route_scales
+            or any(
+                isinstance(scale, bool)
+                or not isinstance(scale, int)
+                or scale not in {1, 2, 4, 8}
+                for scale in route_scales
+            )
+            or len(set(route_scales)) != len(route_scales)
+        ):
+            raise ConfigError(
+                "model.multi_route_fusion.fusion_scales must be unique values "
+                "from 1/2/4/8"
+            )
+        for key, default in (("gate_reduction", 8), ("heads", 8)):
+            value = multi_route_fusion.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ConfigError(
+                    f"model.multi_route_fusion.{key} must be a positive integer"
+                )
+        refinements = multi_route_fusion.get("refinements", 1)
+        if (
+            isinstance(refinements, bool)
+            or not isinstance(refinements, int)
+            or not 0 <= refinements <= 2
+        ):
+            raise ConfigError(
+                "model.multi_route_fusion.refinements must be an integer in [0, 2]"
+            )
+        try:
+            route_residual_init = float(
+                multi_route_fusion.get("residual_init", 0.02)
+            )
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                "model.multi_route_fusion.residual_init must be numeric"
+            ) from error
+        if not math.isfinite(route_residual_init):
+            raise ConfigError(
+                "model.multi_route_fusion.residual_init must be finite"
+            )
+        if fusion_enabled and not 0.0 < route_residual_init <= 1.0:
+            raise ConfigError(
+                "Enabled multi-route fusion requires residual_init in (0, 1]"
+            )
+        if not fusion_enabled and not 0.0 <= route_residual_init <= 1.0:
+            raise ConfigError(
+                "model.multi_route_fusion.residual_init must lie in [0, 1]"
+            )
+        bottleneck_channels = int(config["model"].get("base_channels", 0)) * 8
+        fusion_heads = int(multi_route_fusion.get("heads", 8))
+        if bottleneck_channels < 1 or bottleneck_channels % fusion_heads != 0:
+            raise ConfigError(
+                "model.multi_route_fusion.heads must divide "
+                "model.base_channels * 8"
+            )
+        if fusion_enabled:
+            if not bool(heavy_unet.get("enabled", False)):
+                raise ConfigError(
+                    "Enabled multi-route fusion requires model.heavy_unet.enabled=true"
+                )
+            if not bool(spatial_frequency.get("enabled", False)):
+                raise ConfigError(
+                    "Enabled multi-route fusion requires "
+                    "model.spatial_frequency.enabled=true"
+                )
+            heavy_scales = heavy_unet.get("fusion_scales", [1, 2, 4, 8])
+            if set(route_scales) != set(heavy_scales):
+                raise ConfigError(
+                    "heavy_unet.fusion_scales and multi_route_fusion.fusion_scales "
+                    "must match"
+                )
     prototypes = config["model"].get("prototypes", {})
     if prototypes:
         reset_enabled = prototypes.get("reset_dead", False)

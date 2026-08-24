@@ -305,6 +305,11 @@ def _build_model(config: Mapping[str, Any]) -> nn.Module:
             }
         )
         return CAMPVSv2(**_filter_kwargs(CAMPVSv2, options))
+    if name not in {"multi_marker_restorer", "multimarkerrestorer", "main"}:
+        raise ValueError(
+            "Unknown model name "
+            f"{name!r}; expected residual_unet, camp_vs_v2, or multi_marker_restorer"
+        )
     options.update(
         {
             "in_channels": input_channels,
@@ -312,7 +317,32 @@ def _build_model(config: Mapping[str, Any]) -> nn.Module:
             "target_names": targets,
         }
     )
-    return MultiMarkerRestorer(**_filter_kwargs(MultiMarkerRestorer, options))
+    model = MultiMarkerRestorer(**_filter_kwargs(MultiMarkerRestorer, options))
+    configured_flags = {
+        key: bool(value.get("enabled", False))
+        for key, value in config["model"].items()
+        if key
+        in {
+            "context",
+            "spatial_frequency",
+            "lightweight_unet",
+            "heavy_unet",
+            "multi_route_fusion",
+        }
+        and isinstance(value, Mapping)
+    }
+    actual_flags = getattr(model, "feature_flags", {})
+    mismatches = {
+        key: {"configured": enabled, "constructed": actual_flags.get(key)}
+        for key, enabled in configured_flags.items()
+        if actual_flags.get(key) is not enabled
+    }
+    if mismatches:
+        raise RuntimeError(
+            "Enabled model features were not constructed; refusing a silent fallback: "
+            f"{mismatches}"
+        )
+    return model
 
 
 def _build_loss(config: Mapping[str, Any]) -> nn.Module:
@@ -1098,6 +1128,7 @@ def _run_train(
         "fold_provenance": trainer.fold_provenance,
         "activity_report": trainer.activity_report,
         "epochs_completed": len(history),
+        "stop_reason": history[-1].get("stop_reason") if history else None,
         "last_checkpoint": str(run_dir / "checkpoints" / "last.ckpt"),
         "best_ssim_checkpoint": str(run_dir / "checkpoints" / "best_ssim.ckpt"),
         "initial_checkpoint": str(Path(initial_checkpoint).resolve())
@@ -1380,6 +1411,10 @@ def command_validate(args: argparse.Namespace) -> dict[str, Any]:
         config=runtime_config,
         task_name=selected_target or runtime_config["train"].get("task_name"),
         image_spec=checkpoint_payload.get("image_spec"),
+        progress_label=(
+            "final validation, no TTA, "
+            f"weights={checkpoint_payload['loaded_weight_source']}"
+        ),
     )
     run_dir = Path(args.checkpoint).resolve().parent.parent
     result = validator.evaluate(records_path=run_dir / "validation" / "per_image.csv")
@@ -1391,6 +1426,10 @@ def command_validate(args: argparse.Namespace) -> dict[str, Any]:
             task_name=selected_target or runtime_config["train"].get("task_name"),
             tta="d4",
             image_spec=checkpoint_payload.get("image_spec"),
+            progress_label=(
+                "final validation, D4 x8, "
+                f"weights={checkpoint_payload['loaded_weight_source']}"
+            ),
         )
         tta_result = tta_validator.evaluate(
             records_path=run_dir / "validation" / "per_image_tta_d4.csv"

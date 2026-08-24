@@ -65,6 +65,10 @@ model:
     frequency_cutoff: 0.35
     frequency_transition_width: 0.08
     residual_init: 0.0
+    adaptive_frequency: false
+    adaptive_reduction: 8
+    adaptive_cutoff_delta: 0.12
+    modulation_init: 0.0
   lightweight_unet:
     enabled: false
     widths: [16, 24, 32, 48]
@@ -73,6 +77,27 @@ model:
     expansion: 2
     fusion_scales: [1, 2, 4]
     residual_init: 0.0
+  # Optional heavier detail branch. It is mutually exclusive with the legacy
+  # lightweight U-Net and remains disabled for every existing configuration.
+  heavy_unet:
+    enabled: false
+    widths: [32, 48, 72, 96]
+    encoder_depths: [2, 2, 3, 3]
+    decoder_depths: [1, 1, 2]
+    local_kernel_size: 3
+    large_kernel_size: 11
+    expansion: 2
+    fusion_scales: [1, 2, 4, 8]
+    checkpoint_blocks: false
+  # Content-adaptive fusion of the NAF backbone, heavy U-Net and frequency
+  # routes. A positive but small residual scale keeps all three paths trainable.
+  multi_route_fusion:
+    enabled: false
+    fusion_scales: [1, 2, 4, 8]
+    gate_reduction: 8
+    heads: 8
+    residual_init: 0.02
+    refinements: 1
   context:
     enabled: false
     grid_size: 3
@@ -82,7 +107,9 @@ model:
     token_dim: 128
     encoder_width: 24
     context_dropout: 0.1
-    fusion_scales: [4, 8, 16]
+    # MultiMarkerRestorer exposes scales 1/2/4/8. CAMP-VS v2 configurations
+    # explicitly override this with their additional 1/16 scale when needed.
+    fusion_scales: [4, 8]
     bottleneck_cross_attention: false
     residual_init: 0.0
     stop_gradient: false

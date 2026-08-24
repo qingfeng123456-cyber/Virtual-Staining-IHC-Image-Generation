@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Mapping
@@ -133,6 +134,7 @@ class Validator:
         tta: str | bool | None = None,
         image_spec: Any = None,
         prototype_diagnostics_dir: str | Path | None = None,
+        progress_label: str | None = None,
     ) -> None:
         configured_device = config_get(
             config, "validation.device", config_get(config, "train.device", "auto")
@@ -226,6 +228,7 @@ class Validator:
         )
         self.prototype_diagnostics_epoch: int | None = None
         self.prototype_diagnostics_weight_source: str | None = None
+        self.progress_label = str(progress_label) if progress_label else "validation"
 
     def _target_image_spec(
         self, target: str, reference: torch.Tensor
@@ -344,6 +347,21 @@ class Validator:
             else None
         )
         started = time.perf_counter()
+        try:
+            batch_count: int | str = len(self.dataloader)
+        except TypeError:
+            batch_count = "?"
+        try:
+            sample_count: int | str = len(self.dataloader.dataset)
+        except (AttributeError, TypeError):
+            sample_count = "?"
+        logging.getLogger("virtual_staining").info(
+            "Validation started | %s | tta=%s | batches=%s | samples=%s",
+            self.progress_label,
+            "d4" if self.tta else "none",
+            batch_count,
+            sample_count,
+        )
         ema_context = (
             self.ema.average_parameters(self.model)
             if self.use_ema and self.ema is not None
@@ -525,6 +543,17 @@ class Validator:
                 writer = csv.DictWriter(handle, fieldnames=list(records[0]))
                 writer.writeheader()
                 writer.writerows(records)
+        macro = aggregate.get("macro", {})
+        logging.getLogger("virtual_staining").info(
+            "Validation complete | %s | tta=%s | images=%d | seconds=%.1f | "
+            "ssim=%.6f | psnr=%.4f",
+            self.progress_label,
+            "d4" if self.tta else "none",
+            len(records),
+            float(time.perf_counter() - started),
+            float(macro.get("mean_ssim", float("nan"))),
+            float(macro.get("mean_psnr", float("nan"))),
+        )
         return aggregate
 
     validate = evaluate
